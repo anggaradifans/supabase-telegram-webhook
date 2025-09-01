@@ -230,6 +230,3 @@ income  10000000 Salary BCA [2025-08-29 11:30] August salary
 curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/deleteWebhook"
 ```
 
----
-
-**That’s it.** Paste this into your repo as `README.md`, and you’re good to go ✨
