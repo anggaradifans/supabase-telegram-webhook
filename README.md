@@ -27,13 +27,42 @@ Supports category, account, optional local date/time (Asia/Jakarta), and auto-re
 
 ---
 
-## Database (DDL summary)
+## Database Setup
+
+### Option A: Using Migrations (Recommended)
+
+This project includes database migrations for easy setup:
+
+1. **Apply migrations via Supabase CLI:**
+   ```bash
+   # From project root
+   supabase link --project-ref <YOUR_PROJECT_REF>
+   supabase db push
+   ```
+
+2. **Or apply manually via Dashboard:**
+   - Go to **Dashboard → SQL Editor**
+   - Run migration files in order from `supabase/migrations/`:
+     1. `20250109010001_initial_schema.sql`
+     2. `20250109010002_seed_data.sql`
+
+### Option B: Manual Schema Creation
+
+If you prefer to create tables manually:
 
 * `transactions(type, amount, category_id, account_id, currency default 'IDR', occurred_at, description, created_at default now())`
 * `categories(name unique, allowed_type default 'both')`
 * `accounts(name unique)`
 
-> If you haven’t created tables yet, run your schema SQL in **Dashboard → SQL Editor** first.
+> **Note:** Using migrations is recommended as they include indexes, validation, and seed data.
+
+### Database Schema Details
+
+- **accounts**: Bank accounts and payment methods (BCA, OVO, Cash, etc.)
+- **categories**: Transaction categories with type restrictions (Food, Salary, etc.)
+- **transactions**: Financial records linking accounts and categories
+- **Includes**: Indexes, validation triggers, and helper views
+- **Seed data**: Common Indonesian accounts and categories
 
 ---
 
