@@ -99,9 +99,147 @@ async function replyToTelegram(chatId, text) {
     },
     body: JSON.stringify({
       chat_id: chatId,
-      text
+      text,
+      parse_mode: "HTML"
     })
   });
+}
+
+// Parse date input for outcome commands
+function parseDateInput(input) {
+  const now = new Date();
+  const jakartaNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Jakarta" }));
+  
+  if (!input || input.toLowerCase() === "today") {
+    // Current month
+    return {
+      year: jakartaNow.getFullYear(),
+      month: jakartaNow.getMonth() + 1, // 1-based
+      isCurrentMonth: true
+    };
+  }
+  
+  // Parse YYYY-MM format
+  const yearMonthMatch = input.match(/^(\d{4})-(\d{1,2})$/);
+  if (yearMonthMatch) {
+    const year = parseInt(yearMonthMatch[1]);
+    const month = parseInt(yearMonthMatch[2]);
+    if (year >= 2000 && year <= 2100 && month >= 1 && month <= 12) {
+      return { year, month, isCurrentMonth: false };
+    }
+  }
+  
+  // Parse YYYY format (entire year)
+  const yearMatch = input.match(/^(\d{4})$/);
+  if (yearMatch) {
+    const year = parseInt(yearMatch[1]);
+    if (year >= 2000 && year <= 2100) {
+      return { year, isFullYear: true };
+    }
+  }
+  
+  throw new Error("Invalid date format. Use: /outcome, /outcome today, /outcome 2024-01, or /outcome 2024");
+}
+
+// Query outcomes for a specific period
+async function queryOutcomes(dateParams) {
+  let query = supabase
+    .from("transactions")
+    .select(`
+      id, type, amount, occurred_at, description,
+      categories(name),
+      accounts(name)
+    `)
+    .eq("type", "outcome")
+    .order("occurred_at", { ascending: false });
+
+  if (dateParams.isFullYear) {
+    // Full year query
+    const startOfYear = new Date(Date.UTC(dateParams.year, 0, 1));
+    const endOfYear = new Date(Date.UTC(dateParams.year + 1, 0, 1));
+    query = query
+      .gte("occurred_at", startOfYear.toISOString())
+      .lt("occurred_at", endOfYear.toISOString());
+  } else {
+    // Monthly query
+    const startOfMonth = new Date(Date.UTC(dateParams.year, dateParams.month - 1, 1));
+    const endOfMonth = new Date(Date.UTC(dateParams.year, dateParams.month, 1));
+    query = query
+      .gte("occurred_at", startOfMonth.toISOString())
+      .lt("occurred_at", endOfMonth.toISOString());
+  }
+
+  const { data, error } = await query;
+  if (error) throw error;
+  
+  return data || [];
+}
+
+// Format outcome report
+function formatOutcomeReport(outcomes, dateParams) {
+  if (outcomes.length === 0) {
+    const period = dateParams.isFullYear 
+      ? `${dateParams.year}`
+      : `${String(dateParams.month).padStart(2, '0')}/${dateParams.year}`;
+    return `📊 No outcomes found for ${period}`;
+  }
+
+  // Calculate total
+  const totalAmount = outcomes.reduce((sum, t) => sum + t.amount, 0);
+  
+  // Group by category
+  const byCategory = outcomes.reduce((acc, t) => {
+    const categoryName = t.categories?.name || 'Unknown';
+    if (!acc[categoryName]) {
+      acc[categoryName] = { amount: 0, count: 0 };
+    }
+    acc[categoryName].amount += t.amount;
+    acc[categoryName].count += 1;
+    return acc;
+  }, {});
+
+  // Format period
+  const period = dateParams.isFullYear 
+    ? `${dateParams.year}`
+    : `${String(dateParams.month).padStart(2, '0')}/${dateParams.year}`;
+  
+  let report = `📊 <b>Outcome Report - ${period}</b>\n\n`;
+  report += `💰 <b>Total: ${totalAmount.toLocaleString('id-ID')} IDR</b>\n`;
+  report += `📝 <b>Transactions: ${outcomes.length}</b>\n\n`;
+  
+  report += `<b>By Category:</b>\n`;
+  Object.entries(byCategory)
+    .sort(([,a], [,b]) => (b as any).amount - (a as any).amount)
+    .forEach(([category, data]) => {
+      const categoryData = data as { amount: number; count: number };
+      const percentage = ((categoryData.amount / totalAmount) * 100).toFixed(1);
+      report += `• ${category}: ${categoryData.amount.toLocaleString('id-ID')} IDR (${percentage}%) - ${categoryData.count}x\n`;
+    });
+
+  // Add recent transactions (top 5)
+  if (outcomes.length > 0) {
+    report += `\n<b>Recent Transactions:</b>\n`;
+    outcomes.slice(0, 5).forEach(t => {
+      const date = new Date(t.occurred_at).toLocaleDateString("en-GB", {
+        timeZone: "Asia/Jakarta",
+        day: "2-digit",
+        month: "2-digit"
+      });
+      const categoryName = t.categories?.name || 'Unknown';
+      const accountName = t.accounts?.name || 'Unknown';
+      report += `• ${date} - ${t.amount.toLocaleString('id-ID')} IDR (${categoryName}/${accountName})`;
+      if (t.description) {
+        report += ` - ${t.description}`;
+      }
+      report += `\n`;
+    });
+    
+    if (outcomes.length > 5) {
+      report += `... and ${outcomes.length - 5} more transactions\n`;
+    }
+  }
+
+  return report;
 }
 // --- Main handler ---
 serve(async (req)=>{
@@ -124,8 +262,36 @@ serve(async (req)=>{
     const text = message.text;
     if (!text) return new Response("ok");
     if (/^\/start|^\/help/i.test(text)) {
-      await replyToTelegram(chatId, "👋 Format: outcome 75000 Food BCA [YYYY-MM-DD HH:MM] Lunch");
+      const helpText = `👋 <b>Financial Tracker Bot</b>
+
+<b>📝 Record Transaction:</b>
+<code>outcome 75000 Food BCA [YYYY-MM-DD HH:MM] Lunch</code>
+<code>income 500000 Salary BCA Monthly salary</code>
+
+<b>📊 Check Reports:</b>
+/outcome - Current month outcomes
+/outcome today - Current month outcomes  
+/outcome 2024-01 - January 2024 outcomes
+/outcome 2024 - All 2024 outcomes
+
+<b>Format:</b> &lt;type&gt; &lt;amount&gt; &lt;Category&gt; &lt;Account&gt; [optional date] &lt;description&gt;`;
+      await replyToTelegram(chatId, helpText);
       return new Response("ok");
+    }
+
+    // Handle /outcome command
+    if (/^\/outcome/i.test(text)) {
+      try {
+        const args = text.substring(8).trim(); // Remove "/outcome" prefix
+        const dateParams = parseDateInput(args);
+        const outcomes = await queryOutcomes(dateParams);
+        const report = formatOutcomeReport(outcomes, dateParams);
+        await replyToTelegram(chatId, report);
+        return new Response("ok");
+      } catch (error) {
+        await replyToTelegram(chatId, `❌ Error: ${error.message}`);
+        return new Response("ok");
+      }
     }
     const p = parseMessage(text);
     const id = await insertTransaction({
