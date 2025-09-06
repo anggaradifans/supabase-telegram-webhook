@@ -1,5 +1,3 @@
-here’s a clean, copy-paste **README** you can drop into your repo 👇
-
 # Telegram ➜ Supabase Edge Function (Personal Finance Logger)
 
 Log income/outcome transactions from Telegram directly into your Supabase Postgres.
@@ -229,4 +227,5 @@ income  10000000 Salary BCA [2025-08-29 11:30] August salary
 ```bash
 curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/deleteWebhook"
 ```
+
 
