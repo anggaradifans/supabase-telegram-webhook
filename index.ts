@@ -34,7 +34,8 @@ function parseMessage(text) {
   const type = typeRaw.toLowerCase();
   const amount = Number(amountRaw.replace(/\./g, "").replace(",", "."));
   if (!Number.isFinite(amount) || amount < 0) throw new Error("Bad amount");
-  const category = categoryRaw.trim();
+  // Capitalize first letter, rest lowercase for consistent formatting
+  const category = categoryRaw.trim().toLowerCase().replace(/^\w/, (c) => c.toUpperCase());
   const account = accountRaw.trim();
   let occurred_at;
   if (occurredRaw) {
@@ -56,7 +57,8 @@ function parseMessage(text) {
   };
 }
 async function getOrCreateCategory(name) {
-  const { data: existing } = await supabase.from("categories").select("id").eq("name", name).maybeSingle();
+  // Search case-insensitively for existing category
+  const { data: existing } = await supabase.from("categories").select("id").ilike("name", name).maybeSingle();
   if (existing) return existing.id;
   // all new categories default to 'both'
   const { data: inserted, error } = await supabase.from("categories").insert({
