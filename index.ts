@@ -143,6 +143,103 @@ function parseDateInput(input) {
   throw new Error("Invalid date format. Use: /outcome, /outcome today, /outcome 2024-01, or /outcome 2024");
 }
 
+// Parse date input for summary commands
+function parseSummaryDateInput(input) {
+  const now = new Date();
+  const jakartaNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Jakarta" }));
+  
+  if (!input || input.toLowerCase() === "today") {
+    // Current month only
+    return [{
+      year: jakartaNow.getFullYear(),
+      month: jakartaNow.getMonth() + 1, // 1-based
+    }];
+  }
+  
+  // Parse month ranges like "Sept 2025 - Oct 2025" or "Sep 2025-Oct 2025"
+  const rangeMatch = input.match(/^(\w+)\s+(\d{4})\s*[-–]\s*(\w+)\s+(\d{4})$/i);
+  if (rangeMatch) {
+    const [, startMonthStr, startYearStr, endMonthStr, endYearStr] = rangeMatch;
+    const startMonth = parseMonthName(startMonthStr);
+    const endMonth = parseMonthName(endMonthStr);
+    const startYear = parseInt(startYearStr);
+    const endYear = parseInt(endYearStr);
+    
+    if (startMonth && endMonth && startYear >= 2000 && endYear >= 2000) {
+      const months: any[] = [];
+      let currentYear = startYear;
+      let currentMonth = startMonth;
+      
+      while (currentYear < endYear || (currentYear === endYear && currentMonth <= endMonth)) {
+        months.push({ year: currentYear, month: currentMonth });
+        currentMonth++;
+        if (currentMonth > 12) {
+          currentMonth = 1;
+          currentYear++;
+        }
+        
+        // Safety check to prevent infinite loops
+        if (months.length > 24) break;
+      }
+      
+      return months;
+    }
+  }
+  
+  // Parse single month like "Sept 2025" or "September 2025"
+  const singleMonthMatch = input.match(/^(\w+)\s+(\d{4})$/i);
+  if (singleMonthMatch) {
+    const [, monthStr, yearStr] = singleMonthMatch;
+    const month = parseMonthName(monthStr);
+    const year = parseInt(yearStr);
+    
+    if (month && year >= 2000 && year <= 2100) {
+      return [{ year, month }];
+    }
+  }
+  
+  // Parse YYYY-MM format
+  const yearMonthMatch = input.match(/^(\d{4})-(\d{1,2})$/);
+  if (yearMonthMatch) {
+    const year = parseInt(yearMonthMatch[1]);
+    const month = parseInt(yearMonthMatch[2]);
+    if (year >= 2000 && year <= 2100 && month >= 1 && month <= 12) {
+      return [{ year, month }];
+    }
+  }
+  
+  throw new Error("Invalid format. Use: /summary, /summary Sept 2025, or /summary Sept 2025 - Oct 2025");
+}
+
+// Parse month name to number
+function parseMonthName(monthStr) {
+  const monthMap = {
+    'jan': 1, 'january': 1, 'januari': 1,
+    'feb': 2, 'february': 2, 'februari': 2,
+    'mar': 3, 'march': 3, 'maret': 3,
+    'apr': 4, 'april': 4,
+    'may': 5, 'mei': 5,
+    'jun': 6, 'june': 6, 'juni': 6,
+    'jul': 7, 'july': 7, 'juli': 7,
+    'aug': 8, 'august': 8, 'agustus': 8,
+    'sep': 9, 'sept': 9, 'september': 9,
+    'oct': 10, 'october': 10, 'oktober': 10,
+    'nov': 11, 'november': 11,
+    'dec': 12, 'december': 12, 'desember': 12
+  };
+  
+  return monthMap[monthStr.toLowerCase()];
+}
+
+// Get month name in English
+function getMonthName(monthNumber) {
+  const months = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+  ];
+  return months[monthNumber - 1] || 'Unknown';
+}
+
 // Query outcomes for a specific period
 async function queryOutcomes(dateParams) {
   let query = supabase
@@ -243,6 +340,135 @@ function formatOutcomeReport(outcomes, dateParams) {
 
   return report;
 }
+
+// Query monthly summary for specific months
+async function querySummaryData(months) {
+  const summaries: any[] = [];
+  
+  for (const { year, month } of months) {
+    // Query income and outcome for this month
+    const startOfMonth = new Date(Date.UTC(year, month - 1, 1));
+    const endOfMonth = new Date(Date.UTC(year, month, 1));
+    
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("type, amount")
+      .gte("occurred_at", startOfMonth.toISOString())
+      .lt("occurred_at", endOfMonth.toISOString())
+      .is("deleted_at", null);
+      
+    if (error) throw error;
+    
+    // Calculate totals
+    let totalIncome = 0;
+    let totalOutcome = 0;
+    
+    (data || []).forEach(transaction => {
+      if (transaction.type === 'income') {
+        totalIncome += transaction.amount;
+      } else if (transaction.type === 'outcome') {
+        totalOutcome += transaction.amount;
+      }
+    });
+    
+    summaries.push({
+      year,
+      month,
+      monthName: getMonthName(month),
+      totalIncome,
+      totalOutcome,
+      balance: totalIncome - totalOutcome,
+      transactionCount: (data || []).length
+    });
+  }
+  
+  return summaries;
+}
+
+// Format monthly summary report
+function formatSummaryReport(summaries) {
+  if (summaries.length === 0) {
+    return `📊 No data found`;
+  }
+  
+  let report = `📊 <b>Monthly Summary</b>\n\n`;
+  
+  summaries.forEach((summary, index) => {
+    const incomeFormatted = new Intl.NumberFormat('id-ID', {
+      style: 'currency',
+      currency: 'IDR',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(summary.totalIncome);
+    
+    const outcomeFormatted = new Intl.NumberFormat('id-ID', {
+      style: 'currency',
+      currency: 'IDR',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(summary.totalOutcome);
+    
+    report += `<b>${summary.monthName}</b>\n`;
+    report += `Income: ${incomeFormatted}\n`;
+    report += `Outcome: ${outcomeFormatted}\n`;
+    
+    // Add balance if there are transactions
+    if (summary.transactionCount > 0) {
+      const balanceFormatted = new Intl.NumberFormat('id-ID', {
+        style: 'currency',
+        currency: 'IDR',
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      }).format(Math.abs(summary.balance));
+      
+      const balanceLabel = summary.balance >= 0 ? 'Surplus' : 'Deficit';
+      report += `${balanceLabel}: ${balanceFormatted}\n`;
+    }
+    
+    // Add spacing between months (except for the last one)
+    if (index < summaries.length - 1) {
+      report += `\n`;
+    }
+  });
+  
+  // Add overall summary if multiple months
+  if (summaries.length > 1) {
+    const totalIncome = summaries.reduce((sum, s) => sum + s.totalIncome, 0);
+    const totalOutcome = summaries.reduce((sum, s) => sum + s.totalOutcome, 0);
+    const totalBalance = totalIncome - totalOutcome;
+    
+    const totalIncomeFormatted = new Intl.NumberFormat('id-ID', {
+      style: 'currency',
+      currency: 'IDR',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(totalIncome);
+    
+    const totalOutcomeFormatted = new Intl.NumberFormat('id-ID', {
+      style: 'currency',
+      currency: 'IDR',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(totalOutcome);
+    
+    const totalBalanceFormatted = new Intl.NumberFormat('id-ID', {
+      style: 'currency',
+      currency: 'IDR',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(Math.abs(totalBalance));
+    
+    report += `\n<b>📈 Total Summary</b>\n`;
+    report += `Total Income: ${totalIncomeFormatted}\n`;
+    report += `Total Outcome: ${totalOutcomeFormatted}\n`;
+    
+    const totalBalanceLabel = totalBalance >= 0 ? 'Total Surplus' : 'Total Deficit';
+    report += `${totalBalanceLabel}: ${totalBalanceFormatted}`;
+  }
+  
+  return report;
+}
+
 // --- Main handler ---
 serve(async (req)=>{
   try {
@@ -276,6 +502,11 @@ serve(async (req)=>{
 /outcome 2024-01 - January 2024 outcomes
 /outcome 2024 - All 2024 outcomes
 
+<b>💰 Monthly Summary:</b>
+/summary - Current month income & outcome
+/summary Sept 2025 - September 2025 summary
+/summary Sept 2025 - Oct 2025 - Range summary
+
 <b>Format:</b> &lt;type&gt; &lt;amount&gt; &lt;Category&gt; &lt;Account&gt; [optional date] &lt;description&gt;`;
       await replyToTelegram(chatId, helpText);
       return new Response("ok");
@@ -288,6 +519,21 @@ serve(async (req)=>{
         const dateParams = parseDateInput(args);
         const outcomes = await queryOutcomes(dateParams);
         const report = formatOutcomeReport(outcomes, dateParams);
+        await replyToTelegram(chatId, report);
+        return new Response("ok");
+      } catch (error) {
+        await replyToTelegram(chatId, `❌ Error: ${error.message}`);
+        return new Response("ok");
+      }
+    }
+
+    // Handle /summary command
+    if (/^\/summary/i.test(text)) {
+      try {
+        const args = text.substring(8).trim(); // Remove "/summary" prefix
+        const months = parseSummaryDateInput(args);
+        const summaries = await querySummaryData(months);
+        const report = formatSummaryReport(summaries);
         await replyToTelegram(chatId, report);
         return new Response("ok");
       } catch (error) {
