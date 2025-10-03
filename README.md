@@ -1,231 +1,121 @@
-# Telegram ➜ Supabase Edge Function (Personal Finance Logger)
+# Telegram OCR Bot - Setup Guide
 
-Log income/outcome transactions from Telegram directly into your Supabase Postgres.
-Supports category, account, optional local date/time (Asia/Jakarta), and auto-replies with a receipt.
+This Telegram bot now supports OCR (Optical Character Recognition) to extract text from images and process financial transactions.
 
----
+## 🆕 OCR Features
 
-## Features
+1. **Image Upload**: Send a photo of a receipt or transaction document
+2. **AI-Powered OCR**: Uses OpenAI Vision API to extract text
+3. **Confirmation Flow**: Review and confirm extracted text before processing
+4. **Manual Correction**: Edit the OCR result if needed
 
-* Parse messages like:
-  `outcome 75000 Food BCA Lunch at warung`
-  `income 10000000 Salary BCA [2025-08-29 11:30] August salary`
-* **Accounts** and **Categories** auto-created if missing
-* **Amounts always positive**; `type` is `income|outcome`
-* **Timezone aware**: optional `[YYYY-MM-DD HH:MM]` is treated as **Jakarta** time and stored as UTC
-* Telegram **reply** confirming saved txn (shows Jakarta time)
+## Environment Variables
 
----
-
-## Prereqs
-
-* Supabase project (Postgres schema created: `accounts`, `categories`, `transactions`, trigger optional)
-* Telegram bot token from **@BotFather**
-* Supabase CLI installed (optional if deploying from dashboard)
-
----
-
-## Database Setup
-
-### Option A: Using Migrations (Recommended)
-
-This project includes database migrations for easy setup:
-
-1. **Apply migrations via Supabase CLI:**
-   ```bash
-   # From project root
-   supabase link --project-ref <YOUR_PROJECT_REF>
-   supabase db push
-   ```
-
-2. **Or apply manually via Dashboard:**
-   - Go to **Dashboard → SQL Editor**
-   - Run migration files in order from `supabase/migrations/`:
-     1. `20250109010001_initial_schema.sql`
-     2. `20250109010002_seed_data.sql`
-
-### Option B: Manual Schema Creation
-
-If you prefer to create tables manually:
-
-* `transactions(type, amount, category_id, account_id, currency default 'IDR', occurred_at, description, created_at default now())`
-* `categories(name unique, allowed_type default 'both')`
-* `accounts(name unique)`
-
-> **Note:** Using migrations is recommended as they include indexes, validation, and seed data.
-
-### Database Schema Details
-
-- **accounts**: Bank accounts and payment methods (BCA, OVO, Cash, etc.)
-- **categories**: Transaction categories with type restrictions (Food, Salary, etc.)
-- **transactions**: Financial records linking accounts and categories
-- **Includes**: Indexes, validation triggers, and helper views
-- **Seed data**: Common Indonesian accounts and categories
-
----
-
-## Function Source
-
-The function file is `index.ts` (Deno runtime).
-It:
-
-* Verifies Telegram webhook via `x-telegram-bot-api-secret-token`
-* Parses text, resolves/creates category & account, inserts transaction
-* Converts optional `[YYYY-MM-DD HH:MM]` from **Asia/Jakarta** to UTC
-* Replies back in Telegram with a receipt
-
-> Keep the imports exactly like this for Supabase Edge Functions:
-
-```ts
-import { serve } from "https://deno.land/std/http/server.ts";
-import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm";
-```
-
----
-
-## Deploy (two ways)
-
-### A) From Supabase Dashboard (simplest)
-
-1. **Edge Functions → Open Editor** → **Create function** → name: `telegram-webhook`
-2. Paste the full `index.ts` content.
-3. Function settings: **Disable “Verify JWT”**.
-4. **Secrets** (Edge Functions → Secrets):
-
-   * `SUPABASE_URL` = `https://<PROJECT-REF>.supabase.co`
-   * `SUPABASE_SERVICE_ROLE_KEY` = your service role key
-   * `TELEGRAM_SECRET_TOKEN` = any long random string (you will reuse below)
-   * `TELEGRAM_BOT_TOKEN` = from BotFather
-   * `ALLOWED_CHAT_IDS` = your Telegram user ID (e.g. `123456789`) or blank
-5. Click **Deploy**; copy the function URL:
-   `https://<PROJECT-REF>.supabase.co/functions/v1/telegram-webhook`
-
-### B) From CLI
+Add these environment variables to your Supabase project:
 
 ```bash
-npm i -g supabase
-supabase login
-supabase link --project-ref <YOUR_PROJECT_REF>
-supabase functions new telegram-webhook   # creates folder & index.ts
-# paste code, then:
-supabase secrets set \
-  SUPABASE_URL=https://<PROJECT-REF>.supabase.co \
-  SUPABASE_SERVICE_ROLE_KEY=<SERVICE_ROLE_KEY> \
-  TELEGRAM_SECRET_TOKEN=<RANDOM_SECRET> \
-  TELEGRAM_BOT_TOKEN=<BOTFATHER_TOKEN> \
-  ALLOWED_CHAT_IDS=123456789
+# Existing variables
+SUPABASE_URL=your_supabase_url
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+TELEGRAM_SECRET_TOKEN=your_telegram_secret_token
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+ALLOWED_CHAT_IDS=comma,separated,chat,ids
+
+# New for OCR
+OPENAI_API_KEY=your_openai_api_key
+```
+
+## Setup Steps
+
+### 1. Get OpenAI API Key
+1. Go to [OpenAI API Keys](https://platform.openai.com/api-keys)
+2. Create a new API key
+3. Add it to your Supabase environment variables
+
+### 2. Deploy the Function
+```bash
 supabase functions deploy telegram-webhook --no-verify-jwt
 ```
 
----
+### 3. Update Environment Variables
+In your Supabase dashboard:
+1. Go to Edge Functions
+2. Select `telegram-webhook`
+3. Add the `OPENAI_API_KEY` environment variable
 
-## Set Telegram Webhook
+## 📸 How to Use OCR
 
-Call Telegram’s API to register your function as the webhook:
+### Method 1: Image Upload
+1. Take a photo of your receipt/transaction document
+2. Send the image to the bot
+3. Wait for OCR processing (few seconds)
+4. Review the extracted text
+5. Reply with:
+   - `yes` or `y` to confirm and save
+   - `no` or `n` to cancel
+   - Or send a corrected version in proper format
 
-```bash
-curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://<PROJECT-REF>.supabase.co/functions/v1/telegram-webhook",
-    "secret_token": "<TELEGRAM_SECRET_TOKEN>"
-  }'
+### Method 2: Manual Entry (existing)
+Continue using text commands as before:
+```
+outcome 75000 Food BCA [2024-01-15 12:30] Lunch at cafe
+income 500000 Salary BCA Monthly salary
 ```
 
-* The `secret_token` **must match** your `TELEGRAM_SECRET_TOKEN`.
-* Telegram will include it in every request header:
-  `x-telegram-bot-api-secret-token: <...>`
+## Example OCR Workflow
 
----
-
-## Message Format
-
-```
-<type> <amount> <category> <account> [optional [YYYY-MM-DD HH:MM]] <description>
-```
-
-**Examples**
-
-```
-outcome 75000 Food BCA Lunch at warung
-income  10000000 Salary BCA [2025-08-29 11:30] August salary
-```
-
-**Rules**
-
-* `type`: `income` or `outcome`
-* `amount`: positive number; `75.000` and `75,000.50` are accepted
-* `category`: single token (e.g., `Food`, `Salary`)
-* `account`: single token (e.g., `BCA`, `OVO`, `Cash`)
-* `[date]` optional; if present, treated as **Asia/Jakarta**, converted to **UTC** for storage
-* `description` optional (free text)
-
-> (You can extend the parser later for multi-word category/account and `Rp75.000` formats.)
-
----
-
-## Timezone Behavior
-
-* **Without `[date]`**: uses the exact function trigger time (`new Date()` in UTC).
-* **With `[date]`**: `YYYY-MM-DD HH:MM` is interpreted as **Jakarta (UTC+7)**, converted to UTC before insert.
-* Bot replies show the stored time rendered in **Asia/Jakarta** for clarity.
-
----
-
-## Testing
-
-1. DM your bot:
-
+1. **Send Image**: Upload photo of receipt
+2. **Bot Response**: 
    ```
-   outcome 76000 Food BCA [2025-08-29 11:30] Koi Teppanyaki
+   🔍 Processing your image with OCR...
+   
+   📋 OCR Results:
+   
+   outcome 25000 Food BCA Coffee and pastry
+   
+   🤖 Is this correct? Reply with:
+   • yes or y to process the transaction
+   • no or n to cancel
+   • Or send a corrected version
    ```
-2. Expect a reply:
+3. **Your Response**: `yes` (or correct any errors)
+4. **Confirmation**: Transaction saved with reference ID
 
-   ```
-   ✅ Saved outcome 76000 IDR
-   Category: Food
-   Account: BCA
-   When: 29/08/2025, 11:30:00
-   Description: Koi Teppanyaki
-   Ref: <uuid>
-   ```
-3. Check **Supabase → Database → Table Editor → transactions** for the row.
-4. Use **Edge Functions → Logs** to debug parsing or DB errors.
+## Supported Image Formats
 
----
+- JPEG/JPG
+- PNG
+- WebP
+- Other formats supported by Telegram
+
+## Error Handling
+
+- **OCR fails**: Bot will show error message, you can try again or enter manually
+- **Parse error**: Bot will ask for correction or cancellation
+- **Timeout**: Pending confirmations expire after 5 minutes
+
+## Cost Considerations
+
+- OpenAI Vision API costs approximately $0.01-0.02 per image
+- Supabase Edge Functions are free up to 500k invocations/month
+- Consider your usage patterns for cost planning
 
 ## Troubleshooting
 
-* **401 Unauthorized** → `TELEGRAM_SECRET_TOKEN` mismatch with `setWebhook` value.
-* **403 forbidden** → Your `chat.id` not in `ALLOWED_CHAT_IDS`.
-* **Insert error** → Check DB constraints (e.g., enums), table names, or function logs.
-* **Wrong time in reply** → Verify you included date in Jakarta, or you’re viewing reply formatted with `Asia/Jakarta`.
+1. **"OpenAI API key not configured"**: Add `OPENAI_API_KEY` to environment variables
+2. **OCR returning poor results**: Ensure images are clear, well-lit, and text is readable
+3. **Bot not responding to images**: Check if image format is supported by Telegram
 
----
+## Tips for Better OCR Results
+
+1. **Good lighting**: Take photos in well-lit conditions
+2. **Clear focus**: Ensure text is sharp and readable
+3. **Straight angle**: Keep the document straight, avoid skewed angles
+4. **High contrast**: Dark text on light background works best
+5. **Clean background**: Avoid cluttered backgrounds
 
 ## Security Notes
 
-* Keep **service role key** in function **secrets** only (never in client).
-* Restrict writers with `ALLOWED_CHAT_IDS`.
-* Optionally enable **RLS** if you later expose REST/RPC to clients (function can keep service role).
-
----
-
-## Optional Enhancements
-
-* Multi-word category/account support (`"Food&Drink"`, `"Bank Central Asia"`)
-* Amount formats like `Rp75.000`, `75k`
-* Emoji-based replies for income (`💰`) vs outcome (`💸`)
-* Commands: `/out 75000 Food BCA Lunch`
-* Analytics RPCs: monthly summary, top categories
-* Budget tables and alerts
-
----
-
-## Unregister Webhook (if needed)
-
-```bash
-curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/deleteWebhook"
-```
-
-
+- Images are processed through OpenAI's API (review their privacy policy)
+- Images are not stored permanently by the bot
+- Consider privacy implications when uploading sensitive financial documents

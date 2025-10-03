@@ -8,7 +8,15 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const TELEGRAM_SECRET_TOKEN = Deno.env.get("TELEGRAM_SECRET_TOKEN");
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN");
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 const ALLOWED_CHAT_IDS = (Deno.env.get("ALLOWED_CHAT_IDS") ?? "").split(",").map((s)=>s.trim()).filter(Boolean);
+
+// Simple in-memory store for pending OCR confirmations
+const pendingConfirmations = new Map<string, {
+  ocrText: string;
+  timestamp: number;
+  imageUrl?: string;
+}>();
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // --- Helpers ---
 // Parse Jakarta local date string "[YYYY-MM-DD HH:MM]" -> UTC Date
@@ -105,6 +113,92 @@ async function replyToTelegram(chatId, text) {
       parse_mode: "HTML"
     })
   });
+}
+
+// Download image from Telegram
+async function downloadTelegramFile(fileId: string): Promise<Uint8Array> {
+  // Get file info from Telegram
+  const fileInfoUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`;
+  const fileInfoResponse = await fetch(fileInfoUrl);
+  const fileInfo = await fileInfoResponse.json();
+  
+  if (!fileInfo.ok) {
+    throw new Error(`Failed to get file info: ${fileInfo.description}`);
+  }
+  
+  // Download the actual file
+  const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
+  const fileResponse = await fetch(fileUrl);
+  
+  if (!fileResponse.ok) {
+    throw new Error(`Failed to download file: ${fileResponse.statusText}`);
+  }
+  
+  return new Uint8Array(await fileResponse.arrayBuffer());
+}
+
+// Convert image to base64 for OpenAI Vision API
+function imageToBase64(imageData: Uint8Array): string {
+  const bytes = Array.from(imageData);
+  const binary = bytes.map(byte => String.fromCharCode(byte)).join('');
+  return btoa(binary);
+}
+
+// Extract text from image using OpenAI Vision API
+async function extractTextFromImage(imageData: Uint8Array): Promise<string> {
+  if (!OPENAI_API_KEY) {
+    throw new Error("OpenAI API key not configured");
+  }
+  
+  const base64Image = imageToBase64(imageData);
+  
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-4-vision-preview",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Extract all text from this image. Focus on financial transaction details like amounts, categories, accounts, dates, and descriptions. Return only the extracted text, formatted clearly. If you see transaction information, try to format it in a way that matches this pattern: 'outcome/income [amount] [category] [account] [date] [description]'"
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:image/jpeg;base64,${base64Image}`,
+                detail: "high"
+              }
+            }
+          ]
+        }
+      ],
+      max_tokens: 500
+    })
+  });
+  
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`OpenAI API error: ${error}`);
+  }
+  
+  const result = await response.json();
+  return result.choices[0]?.message?.content || "No text detected";
+}
+
+// Clean up old pending confirmations (older than 5 minutes)
+function cleanupOldConfirmations() {
+  const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+  for (const [chatId, data] of pendingConfirmations.entries()) {
+    if (data.timestamp < fiveMinutesAgo) {
+      pendingConfirmations.delete(chatId);
+    }
+  }
 }
 
 // Parse date input for outcome commands
@@ -487,14 +581,124 @@ serve(async (req)=>{
         status: 403
       });
     }
+    
+    // Clean up old confirmations
+    cleanupOldConfirmations();
+    
+    // Handle photo messages
+    if (message.photo && message.photo.length > 0) {
+      try {
+        await replyToTelegram(chatId, "🔍 Processing your image with OCR...");
+        
+        // Get the largest photo size
+        const photo = message.photo[message.photo.length - 1];
+        const imageData = await downloadTelegramFile(photo.file_id);
+        const extractedText = await extractTextFromImage(imageData);
+        
+        // Store the OCR result for confirmation
+        pendingConfirmations.set(chatId, {
+          ocrText: extractedText,
+          timestamp: Date.now()
+        });
+        
+        const confirmationMessage = `📋 <b>OCR Results:</b>\n\n<code>${extractedText}</code>\n\n🤖 Is this correct? Reply with:\n• <b>yes</b> or <b>y</b> to process the transaction\n• <b>no</b> or <b>n</b> to cancel\n• Or send a corrected version`;
+        
+        await replyToTelegram(chatId, confirmationMessage);
+        return new Response("ok");
+      } catch (error) {
+        console.error("OCR Error:", error);
+        await replyToTelegram(chatId, `❌ OCR Error: ${error.message}`);
+        return new Response("ok");
+      }
+    }
+    
     const text = message.text;
     if (!text) return new Response("ok");
+    
+    // Handle confirmation responses
+    if (pendingConfirmations.has(chatId)) {
+      const pendingData = pendingConfirmations.get(chatId)!;
+      const response = text.toLowerCase().trim();
+      
+      if (response === 'yes' || response === 'y') {
+        // Process the OCR text as a transaction
+        try {
+          const p = parseMessage(pendingData.ocrText);
+          const id = await insertTransaction({
+            type: p.type,
+            amount: p.amount,
+            categoryName: p.category,
+            accountName: p.account,
+            occurred_at: p.occurred_at,
+            description: p.description
+          });
+          
+          // Format reply with Jakarta local time
+          const when = new Date(p.occurred_at).toLocaleString("en-GB", {
+            timeZone: "Asia/Jakarta",
+            hour12: false
+          });
+          let replyText = `✅ Confirmed and saved ${p.type} ${p.amount} IDR\nCategory: ${p.category}\nAccount: ${p.account}\nWhen: ${when}`;
+          if (p.description) {
+            replyText += `\nDescription: ${p.description}`;
+          }
+          replyText += `\nRef: ${id}`;
+          
+          await replyToTelegram(chatId, replyText);
+          pendingConfirmations.delete(chatId);
+          return new Response("ok");
+        } catch (error) {
+          await replyToTelegram(chatId, `❌ Error processing OCR text: ${error.message}\n\nPlease send a corrected version or try again.`);
+          return new Response("ok");
+        }
+      } else if (response === 'no' || response === 'n') {
+        // Cancel the OCR transaction
+        pendingConfirmations.delete(chatId);
+        await replyToTelegram(chatId, "❌ OCR transaction cancelled. You can send a new image or type a transaction manually.");
+        return new Response("ok");
+      } else {
+        // Treat as corrected version
+        try {
+          const p = parseMessage(text);
+          const id = await insertTransaction({
+            type: p.type,
+            amount: p.amount,
+            categoryName: p.category,
+            accountName: p.account,
+            occurred_at: p.occurred_at,
+            description: p.description
+          });
+          
+          // Format reply with Jakarta local time
+          const when = new Date(p.occurred_at).toLocaleString("en-GB", {
+            timeZone: "Asia/Jakarta",
+            hour12: false
+          });
+          let replyText = `✅ Corrected and saved ${p.type} ${p.amount} IDR\nCategory: ${p.category}\nAccount: ${p.account}\nWhen: ${when}`;
+          if (p.description) {
+            replyText += `\nDescription: ${p.description}`;
+          }
+          replyText += `\nRef: ${id}`;
+          
+          await replyToTelegram(chatId, replyText);
+          pendingConfirmations.delete(chatId);
+          return new Response("ok");
+        } catch (error) {
+          await replyToTelegram(chatId, `❌ Error with corrected format: ${error.message}\n\nPlease check the format or reply 'no' to cancel.`);
+          return new Response("ok");
+        }
+      }
+    }
+    
     if (/^\/start|^\/help/i.test(text)) {
       const helpText = `👋 <b>Financial Tracker Bot</b>
 
 <b>📝 Record Transaction:</b>
 <code>outcome 75000 Food BCA [YYYY-MM-DD HH:MM] Lunch</code>
 <code>income 500000 Salary BCA Monthly salary</code>
+
+<b>📸 OCR from Image:</b>
+Send a photo of receipt/transaction and I'll extract the text for you to confirm
 
 <b>📊 Check Reports:</b>
 /outcome - Current month outcomes
@@ -541,6 +745,8 @@ serve(async (req)=>{
         return new Response("ok");
       }
     }
+    
+    // Handle regular text transaction
     const p = parseMessage(text);
     const id = await insertTransaction({
       type: p.type,
