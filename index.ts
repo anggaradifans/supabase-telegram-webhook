@@ -9,6 +9,7 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const TELEGRAM_SECRET_TOKEN = Deno.env.get("TELEGRAM_SECRET_TOKEN");
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN");
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
+const OCR_METHOD = Deno.env.get("OCR_METHOD") || "openai"; // "openai", "google", "tesseract"
 const ALLOWED_CHAT_IDS = (Deno.env.get("ALLOWED_CHAT_IDS") ?? "").split(",").map((s)=>s.trim()).filter(Boolean);
 
 // Simple in-memory store for pending OCR confirmations
@@ -85,7 +86,229 @@ async function getOrCreateAccount(name) {
   if (error) throw error;
   return inserted.id;
 }
-async function insertTransaction(p) {
+// Get or create Telegram user and return Supabase user ID
+async function getTelegramUser(telegramUserId: number, telegramUsername?: string, telegramFirstName?: string, telegramLastName?: string) {
+  const { data: existing, error: fetchError } = await supabase
+    .from("telegram_users")
+    .select("supabase_user_id, is_active")
+    .eq("telegram_user_id", telegramUserId)
+    .maybeSingle();
+  
+  if (fetchError) throw fetchError;
+  
+  if (existing) {
+    // Update last activity and user info
+    await supabase
+      .from("telegram_users")
+      .update({
+        last_activity_at: new Date().toISOString(),
+        telegram_username: telegramUsername,
+        telegram_first_name: telegramFirstName,
+        telegram_last_name: telegramLastName,
+        updated_at: new Date().toISOString()
+      })
+      .eq("telegram_user_id", telegramUserId);
+    
+    if (!existing.is_active) {
+      throw new Error("Your Telegram account is not active. Please contact support.");
+    }
+    
+    return existing.supabase_user_id;
+  }
+  
+  // User not registered
+  return null;
+}
+
+// Register Telegram user with Supabase user ID
+async function registerTelegramUser(telegramUserId: number, supabaseUserId: string, telegramUsername?: string, telegramFirstName?: string, telegramLastName?: string) {
+  // Check if Supabase user exists
+  const { data: supabaseUser, error: userError } = await supabase.auth.admin.getUserById(supabaseUserId);
+  if (userError || !supabaseUser) {
+    throw new Error("Invalid Supabase user ID. Please check your user ID.");
+  }
+  
+  // Check if Telegram user already exists
+  const { data: existing } = await supabase
+    .from("telegram_users")
+    .select("id")
+    .eq("telegram_user_id", telegramUserId)
+    .maybeSingle();
+  
+  if (existing) {
+    // Update existing record
+    const { error } = await supabase
+      .from("telegram_users")
+      .update({
+        supabase_user_id: supabaseUserId,
+        telegram_username: telegramUsername,
+        telegram_first_name: telegramFirstName,
+        telegram_last_name: telegramLastName,
+        is_active: true,
+        last_activity_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq("telegram_user_id", telegramUserId);
+    
+    if (error) throw error;
+    return "updated";
+  }
+  
+  // Create new record
+  const { error } = await supabase
+    .from("telegram_users")
+    .insert({
+      telegram_user_id: telegramUserId,
+      telegram_username: telegramUsername,
+      telegram_first_name: telegramFirstName,
+      telegram_last_name: telegramLastName,
+      supabase_user_id: supabaseUserId,
+      is_active: true,
+      last_activity_at: new Date().toISOString()
+    });
+  
+  if (error) throw error;
+  return "created";
+}
+
+// Check budget after transaction insertion
+async function checkBudgetStatus(userId: string, categoryId: string, transactionAmount: number, occurredAt: string) {
+  const transactionDate = new Date(occurredAt);
+  
+  // Get active budgets for this category and user
+  const { data: budgets, error } = await supabase
+    .from("budgets")
+    .select("id, amount, period, start_date, end_date, currency")
+    .eq("user_id", userId)
+    .eq("category_id", categoryId)
+    .lte("start_date", transactionDate.toISOString())
+    .or(`end_date.is.null,end_date.gte.${transactionDate.toISOString()}`);
+  
+  if (error) {
+    console.error("Error fetching budgets:", error);
+    return null;
+  }
+  
+  if (!budgets || budgets.length === 0) {
+    return { alerts: null, progress: null }; // No budgets for this category
+  }
+  
+  // Check each budget
+  const budgetAlerts: string[] = [];
+  const budgetProgress: string[] = [];
+  
+  for (const budget of budgets) {
+    let periodStart: Date;
+    let periodEnd: Date;
+    
+    // Calculate period based on budget period type and transaction date
+    switch (budget.period) {
+      case "daily":
+        // Daily: use the day of the transaction
+        periodStart = new Date(transactionDate);
+        periodStart.setUTCHours(0, 0, 0, 0);
+        periodEnd = new Date(periodStart);
+        periodEnd.setUTCDate(periodEnd.getUTCDate() + 1);
+        break;
+      case "weekly":
+        // Weekly: find the week containing the transaction date
+        const dayOfWeek = transactionDate.getUTCDay();
+        periodStart = new Date(transactionDate);
+        periodStart.setUTCDate(periodStart.getUTCDate() - dayOfWeek);
+        periodStart.setUTCHours(0, 0, 0, 0);
+        periodEnd = new Date(periodStart);
+        periodEnd.setUTCDate(periodEnd.getUTCDate() + 7);
+        break;
+      case "monthly":
+        // Monthly: use the month of the transaction date
+        periodStart = new Date(Date.UTC(transactionDate.getUTCFullYear(), transactionDate.getUTCMonth(), 1));
+        periodEnd = new Date(Date.UTC(transactionDate.getUTCFullYear(), transactionDate.getUTCMonth() + 1, 1));
+        break;
+      case "yearly":
+        // Yearly: use the year of the transaction date
+        periodStart = new Date(Date.UTC(transactionDate.getUTCFullYear(), 0, 1));
+        periodEnd = new Date(Date.UTC(transactionDate.getUTCFullYear() + 1, 0, 1));
+        break;
+      default:
+        continue;
+    }
+    
+    // Check if transaction falls within this budget period
+    // Also verify the period is within budget's start_date and end_date
+    const budgetStart = new Date(budget.start_date);
+    const budgetEnd = budget.end_date ? new Date(budget.end_date) : null;
+    
+    if (transactionDate < budgetStart || (budgetEnd && transactionDate >= budgetEnd)) {
+      continue;
+    }
+    
+    if (periodStart < budgetStart) {
+      periodStart = budgetStart;
+    }
+    if (budgetEnd && periodEnd > budgetEnd) {
+      periodEnd = budgetEnd;
+    }
+    
+    // Calculate net spending (outcome - income) in this period
+    const { data: transactions, error: txError } = await supabase
+      .from("transactions")
+      .select("type, amount")
+      .eq("user_id", userId)
+      .eq("category_id", categoryId)
+      .in("type", ["outcome", "income"])
+      .gte("occurred_at", periodStart.toISOString())
+      .lt("occurred_at", periodEnd.toISOString())
+      .is("deleted_at", null);
+    
+    if (txError) {
+      console.error("Error fetching transactions for budget check:", txError);
+      continue;
+    }
+    
+    // Calculate net spending: outcome - income
+    let totalOutcome = 0;
+    let totalIncome = 0;
+    (transactions || []).forEach(t => {
+      if (t.type === "outcome") {
+        totalOutcome += Number(t.amount);
+      } else if (t.type === "income") {
+        totalIncome += Number(t.amount);
+      }
+    });
+    const totalSpent = totalOutcome - totalIncome;
+    const budgetAmount = Number(budget.amount);
+    // Calculate percentage based on net spending (can be negative if income > outcome)
+    const percentageUsed = totalSpent > 0 ? (totalSpent / budgetAmount) * 100 : 0;
+    const remaining = budgetAmount - totalSpent;
+    
+    // Get period label
+    const periodLabel = budget.period.charAt(0).toUpperCase() + budget.period.slice(1);
+    
+    // Format progress info (use Math.max to ensure non-negative display)
+    const displaySpent = Math.max(0, totalSpent);
+    const progressInfo = `💰 <b>Budget Progress (${periodLabel})</b>\nNet Spent: ${displaySpent.toLocaleString('id-ID')} / ${budgetAmount.toLocaleString('id-ID')} ${budget.currency} (${percentageUsed.toFixed(1)}%)\nRemaining: ${remaining.toLocaleString('id-ID')} ${budget.currency}`;
+    
+    // Alert if budget exceeded or close to limit
+    if (totalSpent > budgetAmount) {
+      const exceeded = totalSpent - budgetAmount;
+      budgetAlerts.push(`⚠️ <b>Budget Exceeded!</b>\nCategory budget exceeded by ${exceeded.toLocaleString('id-ID')} ${budget.currency}\nBudget: ${budgetAmount.toLocaleString('id-ID')} ${budget.currency}\nNet Spent: ${displaySpent.toLocaleString('id-ID')} ${budget.currency}`);
+      budgetProgress.push(progressInfo);
+    } else if (percentageUsed >= 90 && totalSpent > 0) {
+      budgetAlerts.push(`⚠️ <b>Budget Warning</b>\n${percentageUsed.toFixed(1)}% of budget used\nBudget: ${budgetAmount.toLocaleString('id-ID')} ${budget.currency}\nNet Spent: ${displaySpent.toLocaleString('id-ID')} ${budget.currency}\nRemaining: ${remaining.toLocaleString('id-ID')} ${budget.currency}`);
+      budgetProgress.push(progressInfo);
+    } else {
+      // Always show progress, even if not warning
+      budgetProgress.push(progressInfo);
+    }
+  }
+  
+  return {
+    alerts: budgetAlerts.length > 0 ? budgetAlerts.join("\n\n") : null,
+    progress: budgetProgress.length > 0 ? budgetProgress.join("\n\n") : null
+  };
+}
+
+async function insertTransaction(p, userId?: string) {
   const category_id = await getOrCreateCategory(p.categoryName);
   const account_id = await getOrCreateAccount(p.accountName);
   const { data, error } = await supabase.from("transactions").insert({
@@ -95,10 +318,27 @@ async function insertTransaction(p) {
     account_id,
     currency: "IDR",
     occurred_at: p.occurred_at,
-    description: p.description
+    description: p.description,
+    user_id: userId || null
   }).select("id").single();
   if (error) throw error;
-  return data.id;
+  
+  // Check budget if user_id is provided and transaction is outcome
+  let budgetInfo: { alerts: string | null; progress: string | null } | null = null;
+  if (userId && p.type === "outcome") {
+    try {
+      const budgetStatus = await checkBudgetStatus(userId, category_id, p.amount, p.occurred_at);
+      // Only set budgetInfo if there's actual progress or alerts to show
+      if (budgetStatus && (budgetStatus.progress || budgetStatus.alerts)) {
+        budgetInfo = budgetStatus;
+      }
+    } catch (error) {
+      console.error("Error checking budget:", error);
+      // Don't fail the transaction if budget check fails
+    }
+  }
+  
+  return { id: data.id, budgetInfo };
 }
 async function replyToTelegram(chatId, text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -113,92 +353,6 @@ async function replyToTelegram(chatId, text) {
       parse_mode: "HTML"
     })
   });
-}
-
-// Download image from Telegram
-async function downloadTelegramFile(fileId: string): Promise<Uint8Array> {
-  // Get file info from Telegram
-  const fileInfoUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`;
-  const fileInfoResponse = await fetch(fileInfoUrl);
-  const fileInfo = await fileInfoResponse.json();
-  
-  if (!fileInfo.ok) {
-    throw new Error(`Failed to get file info: ${fileInfo.description}`);
-  }
-  
-  // Download the actual file
-  const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
-  const fileResponse = await fetch(fileUrl);
-  
-  if (!fileResponse.ok) {
-    throw new Error(`Failed to download file: ${fileResponse.statusText}`);
-  }
-  
-  return new Uint8Array(await fileResponse.arrayBuffer());
-}
-
-// Convert image to base64 for OpenAI Vision API
-function imageToBase64(imageData: Uint8Array): string {
-  const bytes = Array.from(imageData);
-  const binary = bytes.map(byte => String.fromCharCode(byte)).join('');
-  return btoa(binary);
-}
-
-// Extract text from image using OpenAI Vision API
-async function extractTextFromImage(imageData: Uint8Array): Promise<string> {
-  if (!OPENAI_API_KEY) {
-    throw new Error("OpenAI API key not configured");
-  }
-  
-  const base64Image = imageToBase64(imageData);
-  
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "gpt-4-vision-preview",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: "Extract all text from this image. Focus on financial transaction details like amounts, categories, accounts, dates, and descriptions. Return only the extracted text, formatted clearly. If you see transaction information, try to format it in a way that matches this pattern: 'outcome/income [amount] [category] [account] [date] [description]'"
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/jpeg;base64,${base64Image}`,
-                detail: "high"
-              }
-            }
-          ]
-        }
-      ],
-      max_tokens: 500
-    })
-  });
-  
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`OpenAI API error: ${error}`);
-  }
-  
-  const result = await response.json();
-  return result.choices[0]?.message?.content || "No text detected";
-}
-
-// Clean up old pending confirmations (older than 5 minutes)
-function cleanupOldConfirmations() {
-  const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
-  for (const [chatId, data] of pendingConfirmations.entries()) {
-    if (data.timestamp < fiveMinutesAgo) {
-      pendingConfirmations.delete(chatId);
-    }
-  }
 }
 
 // Parse date input for outcome commands
@@ -582,33 +736,25 @@ serve(async (req)=>{
       });
     }
     
-    // Clean up old confirmations
-    cleanupOldConfirmations();
+    // Extract Telegram user info
+    const telegramUserId = message.from?.id;
+    const telegramUsername = message.from?.username;
+    const telegramFirstName = message.from?.first_name;
+    const telegramLastName = message.from?.last_name;
     
-    // Handle photo messages
-    if (message.photo && message.photo.length > 0) {
+    // Get Supabase user ID if registered (for non-register commands)
+    let supabaseUserId: string | null = null;
+    if (telegramUserId && !/^\/register/i.test(message.text || "")) {
       try {
-        await replyToTelegram(chatId, "🔍 Processing your image with OCR...");
-        
-        // Get the largest photo size
-        const photo = message.photo[message.photo.length - 1];
-        const imageData = await downloadTelegramFile(photo.file_id);
-        const extractedText = await extractTextFromImage(imageData);
-        
-        // Store the OCR result for confirmation
-        pendingConfirmations.set(chatId, {
-          ocrText: extractedText,
-          timestamp: Date.now()
-        });
-        
-        const confirmationMessage = `📋 <b>OCR Results:</b>\n\n<code>${extractedText}</code>\n\n🤖 Is this correct? Reply with:\n• <b>yes</b> or <b>y</b> to process the transaction\n• <b>no</b> or <b>n</b> to cancel\n• Or send a corrected version`;
-        
-        await replyToTelegram(chatId, confirmationMessage);
-        return new Response("ok");
+        supabaseUserId = await getTelegramUser(
+          telegramUserId,
+          telegramUsername,
+          telegramFirstName,
+          telegramLastName
+        );
       } catch (error) {
-        console.error("OCR Error:", error);
-        await replyToTelegram(chatId, `❌ OCR Error: ${error.message}`);
-        return new Response("ok");
+        // User not registered or error - will be handled per command
+        console.log("Telegram user not registered or error:", error);
       }
     }
     
@@ -624,14 +770,14 @@ serve(async (req)=>{
         // Process the OCR text as a transaction
         try {
           const p = parseMessage(pendingData.ocrText);
-          const id = await insertTransaction({
+          const result = await insertTransaction({
             type: p.type,
             amount: p.amount,
             categoryName: p.category,
             accountName: p.account,
             occurred_at: p.occurred_at,
             description: p.description
-          });
+          }, supabaseUserId || undefined);
           
           // Format reply with Jakarta local time
           const when = new Date(p.occurred_at).toLocaleString("en-GB", {
@@ -642,7 +788,17 @@ serve(async (req)=>{
           if (p.description) {
             replyText += `\nDescription: ${p.description}`;
           }
-          replyText += `\nRef: ${id}`;
+          replyText += `\nRef: ${result.id}`;
+          
+          // Add budget progress and alerts if available
+          if (result.budgetInfo) {
+            if (result.budgetInfo.progress) {
+              replyText += `\n\n${result.budgetInfo.progress}`;
+            }
+            if (result.budgetInfo.alerts) {
+              replyText += `\n\n${result.budgetInfo.alerts}`;
+            }
+          }
           
           await replyToTelegram(chatId, replyText);
           pendingConfirmations.delete(chatId);
@@ -660,14 +816,14 @@ serve(async (req)=>{
         // Treat as corrected version
         try {
           const p = parseMessage(text);
-          const id = await insertTransaction({
+          const result = await insertTransaction({
             type: p.type,
             amount: p.amount,
             categoryName: p.category,
             accountName: p.account,
             occurred_at: p.occurred_at,
             description: p.description
-          });
+          }, supabaseUserId || undefined);
           
           // Format reply with Jakarta local time
           const when = new Date(p.occurred_at).toLocaleString("en-GB", {
@@ -678,7 +834,17 @@ serve(async (req)=>{
           if (p.description) {
             replyText += `\nDescription: ${p.description}`;
           }
-          replyText += `\nRef: ${id}`;
+          replyText += `\nRef: ${result.id}`;
+          
+          // Add budget progress and alerts if available
+          if (result.budgetInfo) {
+            if (result.budgetInfo.progress) {
+              replyText += `\n\n${result.budgetInfo.progress}`;
+            }
+            if (result.budgetInfo.alerts) {
+              replyText += `\n\n${result.budgetInfo.alerts}`;
+            }
+          }
           
           await replyToTelegram(chatId, replyText);
           pendingConfirmations.delete(chatId);
@@ -692,6 +858,9 @@ serve(async (req)=>{
     
     if (/^\/start|^\/help/i.test(text)) {
       const helpText = `👋 <b>Financial Tracker Bot</b>
+
+<b>🔐 Registration:</b>
+/register &lt;supabase_user_id&gt; - Link your Telegram account to Supabase
 
 <b>📝 Record Transaction:</b>
 <code>outcome 75000 Food BCA [YYYY-MM-DD HH:MM] Lunch</code>
@@ -714,6 +883,40 @@ Send a photo of receipt/transaction and I'll extract the text for you to confirm
 <b>Format:</b> &lt;type&gt; &lt;amount&gt; &lt;Category&gt; &lt;Account&gt; [optional date] &lt;description&gt;`;
       await replyToTelegram(chatId, helpText);
       return new Response("ok");
+    }
+
+    // Handle /register command
+    if (/^\/register/i.test(text)) {
+      try {
+        if (!telegramUserId) {
+          await replyToTelegram(chatId, "❌ Unable to identify Telegram user. Please try again.");
+          return new Response("ok");
+        }
+        
+        const args = text.substring(9).trim(); // Remove "/register" prefix
+        if (!args) {
+          await replyToTelegram(chatId, "❌ Please provide your Supabase user ID.\n\nUsage: /register &lt;supabase_user_id&gt;\n\nYou can find your user ID in your Supabase dashboard.");
+          return new Response("ok");
+        }
+        
+        const result = await registerTelegramUser(
+          telegramUserId,
+          args,
+          telegramUsername,
+          telegramFirstName,
+          telegramLastName
+        );
+        
+        if (result === "created") {
+          await replyToTelegram(chatId, `✅ <b>Registration Successful!</b>\n\nYour Telegram account has been linked to your Supabase account.\n\nYou can now use all features including budget tracking.`);
+        } else {
+          await replyToTelegram(chatId, `✅ <b>Account Updated!</b>\n\nYour Telegram account information has been updated.`);
+        }
+        return new Response("ok");
+      } catch (error) {
+        await replyToTelegram(chatId, `❌ Registration failed: ${error.message}\n\nPlease check your Supabase user ID and try again.`);
+        return new Response("ok");
+      }
     }
 
     // Handle /outcome command
@@ -748,14 +951,14 @@ Send a photo of receipt/transaction and I'll extract the text for you to confirm
     
     // Handle regular text transaction
     const p = parseMessage(text);
-    const id = await insertTransaction({
+    const result = await insertTransaction({
       type: p.type,
       amount: p.amount,
       categoryName: p.category,
       accountName: p.account,
       occurred_at: p.occurred_at,
       description: p.description
-    });
+    }, supabaseUserId || undefined);
     // Format reply with Jakarta local time
     const when = new Date(p.occurred_at).toLocaleString("en-GB", {
       timeZone: "Asia/Jakarta",
@@ -765,11 +968,22 @@ Send a photo of receipt/transaction and I'll extract the text for you to confirm
     if (p.description) {
       replyText += `\nDescription: ${p.description}`;
     }
-    replyText += `\nRef: ${id}`;
+    replyText += `\nRef: ${result.id}`;
+    
+    // Add budget progress and alerts if available
+    if (result.budgetInfo) {
+      if (result.budgetInfo.progress) {
+        replyText += `\n\n${result.budgetInfo.progress}`;
+      }
+      if (result.budgetInfo.alerts) {
+        replyText += `\n\n${result.budgetInfo.alerts}`;
+      }
+    }
+    
     await replyToTelegram(chatId, replyText);
     return new Response(JSON.stringify({
       ok: true,
-      id
+      id: result.id
     }), {
       status: 200,
       headers: {
