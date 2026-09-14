@@ -342,6 +342,7 @@ async function insertTransaction(p, userId?: string) {
 }
 
 async function confirmStagedTransaction(stagingId: string, telegramUserId?: number) {
+  const now = new Date().toISOString();
   const { data: stagingData, error: fetchError } = await supabase
     .from("transaction_staging")
     .select("*")
@@ -353,6 +354,24 @@ async function confirmStagedTransaction(stagingId: string, telegramUserId?: numb
   }
   if (stagingData.status !== "pending") {
     throw new Error(`Already ${stagingData.status}.`);
+  }
+
+  const { data: claimedRows, error: claimError } = await supabase
+    .from("transaction_staging")
+    .update({
+      status: "confirmed",
+      confirmed_at: now
+    })
+    .eq("id", stagingId)
+    .eq("status", "pending")
+    .select("id");
+
+  if (claimError) {
+    console.error("Confirm claim error", claimError);
+    throw new Error("Failed to confirm transaction.");
+  }
+  if (!claimedRows?.length) {
+    throw new Error("Already processed.");
   }
 
   let targetUserId = stagingData.user_id;
@@ -385,16 +404,17 @@ async function confirmStagedTransaction(stagingId: string, telegramUserId?: numb
 
   if (insertError) {
     console.error("Insert Error", insertError);
+    await supabase
+      .from("transaction_staging")
+      .update({
+        status: "pending",
+        confirmed_at: null
+      })
+      .eq("id", stagingId)
+      .eq("status", "confirmed")
+      .eq("confirmed_at", now);
     throw new Error("Failed to save transaction.");
   }
-
-  await supabase
-    .from("transaction_staging")
-    .update({
-      status: "confirmed",
-      confirmed_at: new Date().toISOString()
-    })
-    .eq("id", stagingId);
 
   let budgetStatus: { alerts: string | null; progress: string | null } | null = null;
   if (targetUserId && txn.type === "outcome") {
@@ -409,6 +429,7 @@ async function confirmStagedTransaction(stagingId: string, telegramUserId?: numb
 }
 
 async function rejectStagedTransaction(stagingId: string) {
+  const now = new Date().toISOString();
   const { data: stagingData, error: fetchError } = await supabase
     .from("transaction_staging")
     .select("*")
@@ -422,65 +443,49 @@ async function rejectStagedTransaction(stagingId: string) {
     throw new Error(`Already ${stagingData.status}.`);
   }
 
-  await supabase
+  const { data: rejectedRows, error: rejectError } = await supabase
     .from("transaction_staging")
     .update({
       status: "rejected",
-      rejected_at: new Date().toISOString()
+      rejected_at: now
     })
-    .eq("id", stagingId);
+    .eq("id", stagingId)
+    .eq("status", "pending")
+    .select("id");
+
+  if (rejectError) {
+    console.error("Reject error", rejectError);
+    throw new Error("Failed to reject transaction.");
+  }
+  if (!rejectedRows?.length) {
+    throw new Error("Already processed.");
+  }
 
   return stagingData;
 }
 
-async function findPendingStagingIdForTelegramReply(replyMessage: any, targetUserId?: string | null) {
+async function findStagingIdForTelegramReply(replyMessage: any) {
   const replyMessageId = replyMessage?.message_id;
   const replyChatId = replyMessage?.chat?.id;
 
-  if (replyMessageId && replyChatId) {
-    const { data, error } = await supabase
-      .from("transaction_staging")
-      .select("id")
-      .eq("status", "pending")
-      .contains("metadata", {
-        telegram_chat_id: String(replyChatId),
-        telegram_message_id: replyMessageId
-      })
-      .order("created_at", { ascending: false })
-      .limit(1);
-
-    if (error) {
-      console.error("Reply staging lookup failed", error);
-    } else if (data?.[0]?.id) {
-      return data[0].id;
-    }
+  if (!replyMessageId || !replyChatId) {
+    return null;
   }
 
-  const findLatestPending = async (filterByUser: boolean) => {
-    let query = supabase
-      .from("transaction_staging")
-      .select("id")
-      .eq("status", "pending")
-      .order("created_at", { ascending: false })
-      .limit(1);
-
-    if (filterByUser && targetUserId) {
-      query = query.eq("user_id", targetUserId);
-    }
-
-    return await query;
-  };
-
-  let { data: stagedRows, error: stagedError } = await findLatestPending(true);
-  if (!stagedRows?.length && targetUserId && !stagedError) {
-    ({ data: stagedRows, error: stagedError } = await findLatestPending(false));
+  const { data, error } = await supabase
+    .from("transaction_staging")
+    .select("id")
+    .contains("metadata", {
+      telegram_chat_id: String(replyChatId),
+      telegram_message_id: replyMessageId
+    })
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (error) {
+    throw new Error(`Could not find replied transaction: ${error.message}`);
   }
 
-  if (stagedError) {
-    throw new Error(`Could not find pending transaction: ${stagedError.message}`);
-  }
-
-  return stagedRows?.[0]?.id || null;
+  return data?.[0]?.id || null;
 }
 async function replyToTelegram(chatId, text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -495,6 +500,33 @@ async function replyToTelegram(chatId, text) {
       parse_mode: "HTML"
     })
   });
+}
+
+async function repairTelegramWebhook() {
+  if (!SUPABASE_URL || !TELEGRAM_BOT_TOKEN || !TELEGRAM_SECRET_TOKEN) {
+    throw new Error("Telegram webhook secrets are incomplete.");
+  }
+
+  const webhookUrl = `${SUPABASE_URL}/functions/v1/telegram-webhook`;
+  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      url: webhookUrl,
+      secret_token: TELEGRAM_SECRET_TOKEN,
+      allowed_updates: ["message", "edited_message", "callback_query"],
+      drop_pending_updates: false
+    })
+  });
+  const payload = await response.json();
+
+  if (!response.ok || !payload?.ok) {
+    throw new Error(payload?.description || `Telegram setWebhook failed with status ${response.status}.`);
+  }
+
+  return webhookUrl;
 }
 
 // Parse date input for outcome commands
@@ -887,6 +919,13 @@ serve(async (req)=>{
     if (update.callback_query) {
       const { id, data, message, from } = update.callback_query;
       const [action, stagingId] = (data || "").split(":");
+      const callbackChatId = String(message?.chat?.id ?? "");
+
+      console.log("Telegram callback received", {
+        action,
+        stagingId,
+        chatId: callbackChatId
+      });
 
       const answerCallback = async (text: string) => {
         await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
@@ -910,15 +949,29 @@ serve(async (req)=>{
       };
 
       try {
+        if (ALLOWED_CHAT_IDS.length && !ALLOWED_CHAT_IDS.includes(callbackChatId)) {
+          await answerCallback("This chat is not allowed.");
+          return new Response("ok");
+        }
+
         if (!stagingId) {
           await answerCallback("Invalid transaction data.");
           return new Response("ok");
         }
 
+        if (action === "confirm" || action === "reject") {
+          await answerCallback(`Processing ${action}...`);
+        }
+
         if (action === "confirm") {
           const { stagingData, budgetStatus } = await confirmStagedTransaction(stagingId, from?.id);
           await editMessageText(`✅ <b>Confirmed & Saved</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${stagingData.description}`);
-          await answerCallback("Saved!");
+
+          console.log("Telegram callback completed", {
+            action,
+            stagingId,
+            chatId: callbackChatId
+          });
 
           if (budgetStatus?.progress) {
             await replyToTelegram(message.chat.id, budgetStatus.progress);
@@ -932,7 +985,11 @@ serve(async (req)=>{
         if (action === "reject") {
           const stagingData = await rejectStagedTransaction(stagingId);
           await editMessageText(`❌ <b>Rejected</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${stagingData.description}`);
-          await answerCallback("Rejected");
+          console.log("Telegram callback completed", {
+            action,
+            stagingId,
+            chatId: callbackChatId
+          });
           return new Response("ok");
         }
 
@@ -940,7 +997,13 @@ serve(async (req)=>{
         return new Response("ok");
       } catch (error) {
         console.error("Callback query error", error);
-        await answerCallback(error instanceof Error ? error.message.slice(0, 180) : "Failed to process callback.");
+        const errorMessage = error instanceof Error ? error.message.slice(0, 500) : "Failed to process callback.";
+        if (message?.chat?.id) {
+          await replyToTelegram(
+            message.chat.id,
+            `❌ Failed to ${action === "reject" ? "reject" : "confirm"} transaction: ${errorMessage}`
+          );
+        }
         return new Response("ok");
       }
     }
@@ -978,6 +1041,25 @@ serve(async (req)=>{
     
     const text = message.text;
     if (!text) return new Response("ok");
+
+    if (/^\/repair_webhook(?:@\w+)?(?:\s+|$)/i.test(text)) {
+      try {
+        const webhookUrl = await repairTelegramWebhook();
+        console.log("Telegram webhook repaired", {
+          webhookUrl,
+          allowedUpdates: ["message", "edited_message", "callback_query"]
+        });
+        await replyToTelegram(
+          chatId,
+          "✅ Telegram webhook repaired. Confirm and Reject buttons are enabled for new and existing alerts."
+        );
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : "Failed to repair Telegram webhook.";
+        console.error("Telegram webhook repair error", error);
+        await replyToTelegram(chatId, `❌ Telegram webhook repair failed: ${errorMessage}`);
+      }
+      return new Response("ok");
+    }
 
     // Confirm all pending staged receipt transactions.
     if (/^\/(confirm_all|confirmall)(?:\s+|$)/i.test(text)) {
@@ -1103,17 +1185,14 @@ ${failures.slice(0, 5).join("\n")}`;
       return new Response("ok");
     }
 
-    // Allow replying with "confirm" / "reject" to the receipt message.
-    // If there is no reply context, fall back to the newest pending staged transaction.
+    // Allow replying with "confirm" / "reject" to the specific receipt message.
     const normalizedText = text.trim().toLowerCase();
     if (/^(confirm|yes|y|reject|no|n)$/i.test(normalizedText)) {
       const isReject = /^(reject|no|n)$/i.test(normalizedText);
-      const targetUserId = supabaseUserId || DEFAULT_SUPABASE_USER_ID;
-
       try {
-        const stagingId = await findPendingStagingIdForTelegramReply(message.reply_to_message, targetUserId);
+        const stagingId = await findStagingIdForTelegramReply(message.reply_to_message);
         if (!stagingId) {
-          await replyToTelegram(chatId, `No pending transaction to ${isReject ? "reject" : "confirm"}.`);
+          await replyToTelegram(chatId, `Reply to the receipt alert you want to ${isReject ? "reject" : "confirm"}.`);
           return new Response("ok");
         }
 
@@ -1142,7 +1221,13 @@ ${budgetStatus.alerts}`;
         await replyToTelegram(chatId, replyText);
         return new Response("ok");
       } catch (error) {
-        await replyToTelegram(chatId, `❌ Failed to ${isReject ? "reject" : "confirm"} transaction: ${error.message}`);
+        const errorMessage = error instanceof Error ? error.message : "Failed to process transaction.";
+        console.error("Telegram reply action error", {
+          action: isReject ? "reject" : "confirm",
+          chatId,
+          error: errorMessage
+        });
+        await replyToTelegram(chatId, `❌ Failed to ${isReject ? "reject" : "confirm"} transaction: ${errorMessage}`);
         return new Response("ok");
       }
     }
