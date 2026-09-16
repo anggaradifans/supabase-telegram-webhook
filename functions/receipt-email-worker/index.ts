@@ -32,7 +32,17 @@ const TELEGRAM_CONFIRM_CHAT_ID = Deno.env.get("TELEGRAM_CONFIRM_CHAT_ID");
 const DEFAULT_SUPABASE_USER_ID = Deno.env.get("DEFAULT_SUPABASE_USER_ID");
 const ALLOWED_CHAT_IDS = (Deno.env.get("ALLOWED_CHAT_IDS") ?? "").split(",").map((s)=>s.trim()).filter(Boolean);
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+  global: {
+    fetch: (input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get("Authorization") === `Bearer ${SUPABASE_SECRET_KEY}`) {
+        headers.delete("Authorization");
+      }
+      return fetch(input, { ...init, headers });
+    }
+  }
+});
 
 type ParsedTransaction = {
   type: "income" | "outcome";

@@ -44,7 +44,17 @@ const pendingConfirmations = new Map<string, {
   timestamp: number;
   imageUrl?: string;
 }>();
-const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+  global: {
+    fetch: (input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get("Authorization") === `Bearer ${SUPABASE_SECRET_KEY}`) {
+        headers.delete("Authorization");
+      }
+      return fetch(input, { ...init, headers });
+    }
+  }
+});
 // --- Helpers ---
 // Parse Jakarta local date string "[YYYY-MM-DD HH:MM]" -> UTC Date
 function parseJakartaDate(str) {

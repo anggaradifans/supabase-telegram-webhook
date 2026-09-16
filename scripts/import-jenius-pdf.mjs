@@ -295,7 +295,6 @@ async function supabaseRequest(path, options = {}) {
       ...options,
       headers: {
         apikey: key,
-        authorization: `Bearer ${key}`,
         "content-type": "application/json",
         ...(options.headers || {})
       }
