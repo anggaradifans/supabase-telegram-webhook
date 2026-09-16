@@ -15,7 +15,6 @@ loadDotEnv(resolve(PROJECT_DIR, ".env"));
 
 const DEFAULT_CATEGORY = process.env.JENIUS_DEFAULT_CATEGORY || "Payment";
 const DEFAULT_ACCOUNT = "Jenius";
-const DEFAULT_USER_ID = process.env.DEFAULT_SUPABASE_USER_ID || null;
 const TELEGRAM_CHAT_ID =
   process.env.TELEGRAM_CONFIRM_CHAT_ID ||
   (process.env.ALLOWED_CHAT_IDS || "").split(",").map((item) => item.trim()).filter(Boolean)[0];
@@ -45,7 +44,7 @@ function usage() {
 
 Required env:
   SUPABASE_URL
-  SUPABASE_SERVICE_ROLE_KEY
+  SUPABASE_SECRET_KEY (preferred) or SUPABASE_SERVICE_ROLE_KEY (temporary compatibility)
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CONFIRM_CHAT_ID or ALLOWED_CHAT_IDS
 
@@ -58,6 +57,10 @@ function requireEnv(name) {
   const value = process.env[name];
   if (!value) throw new Error(`Missing ${name}`);
   return value;
+}
+
+function getSupabaseSecretKey() {
+  return process.env.SUPABASE_SECRET_KEY || requireEnv("SUPABASE_SERVICE_ROLE_KEY");
 }
 
 function normalizeAmount(raw) {
@@ -283,7 +286,7 @@ function parseJeniusTransactions(text, sourceFile) {
 
 async function supabaseRequest(path, options = {}) {
   const url = `${requireEnv("SUPABASE_URL").replace(/\/$/, "")}/rest/v1/${path}`;
-  const key = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
+  const key = getSupabaseSecretKey();
   const method = options.method || "GET";
   let response;
 
@@ -301,8 +304,7 @@ async function supabaseRequest(path, options = {}) {
     console.error("Supabase request failed before receiving a response.", {
       method,
       url,
-      message: error instanceof Error ? error.message : String(error),
-      cause: error?.cause
+      code: error?.cause?.code
     });
     throw error;
   }
@@ -343,15 +345,11 @@ async function fetchWithRetry(url, options, label) {
   }
 }
 
-async function getOrCreate(table, name, extra = {}) {
-  const encoded = encodeURIComponent(name);
-  const found = await supabaseRequest(`${table}?select=id&name=ilike.${encoded}&limit=1`);
-  if (found?.[0]) return found[0].id;
-
-  const inserted = await supabaseRequest(`${table}?select=id`, {
+async function getOrCreateAccount(name) {
+  const inserted = await supabaseRequest("accounts?select=id&on_conflict=name", {
     method: "POST",
-    headers: { prefer: "return=representation" },
-    body: JSON.stringify({ name, ...extra })
+    headers: { prefer: "return=representation,resolution=merge-duplicates" },
+    body: JSON.stringify({ name })
   });
   return inserted[0].id;
 }
@@ -361,14 +359,18 @@ async function findDuplicate(row) {
   const amount = encodeURIComponent(String(row.amount));
   const description = encodeURIComponent(row.description);
   const existing = await supabaseRequest(
-    `transaction_staging?select=id,status&status=neq.rejected&occurred_at=eq.${occurred}&amount=eq.${amount}&description=eq.${description}&limit=1`
+    `transaction_staging?select=id,status&user_id=eq.${encodeURIComponent(requireEnv("DEFAULT_SUPABASE_USER_ID"))}&status=neq.rejected&occurred_at=eq.${occurred}&amount=eq.${amount}&description=eq.${description}&limit=1`
   );
   return existing?.[0] || null;
 }
 
 async function insertStaging(row) {
-  const category_id = await getOrCreate("categories", row.categoryName, { allowed_type: "both" });
-  const account_id = await getOrCreate("accounts", row.accountName);
+  const userId = requireEnv("DEFAULT_SUPABASE_USER_ID");
+  const category_id = await supabaseRequest("rpc/backend_resolve_category", {
+    method: "POST",
+    body: JSON.stringify({ p_user_id: userId, p_name: row.categoryName })
+  });
+  const account_id = await getOrCreateAccount(row.accountName);
   const duplicate = await findDuplicate(row);
   if (duplicate) return { id: duplicate.id, duplicate: true };
 
@@ -380,7 +382,7 @@ async function insertStaging(row) {
       amount: row.amount,
       category_id,
       account_id,
-      user_id: DEFAULT_USER_ID,
+      user_id: userId,
       currency: "IDR",
       occurred_at: row.occurred_at,
       description: row.description,
@@ -422,10 +424,9 @@ async function sendTelegramConfirmation(stagingId, row, duplicate) {
     console.error("Telegram request failed before receiving a response.", {
       url: "https://api.telegram.org/bot<redacted>/sendMessage",
       chatId: TELEGRAM_CHAT_ID,
-      message: error instanceof Error ? error.message : String(error),
-      cause: error?.cause
+      code: error?.cause?.code
     });
-    throw error;
+    throw new Error("Telegram request failed.");
   }
 
   const payload = await response.json();

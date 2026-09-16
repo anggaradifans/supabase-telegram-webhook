@@ -1,18 +1,38 @@
 // Supabase Edge Function (Deno runtime)
-// Name: email-receipt-webhook
-// Deploy: supabase functions deploy email-receipt-webhook --no-verify-jwt
+// Name: receipt-email-worker
+// Deploy: supabase functions deploy receipt-email-worker --no-verify-jwt
 import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+function getSupabaseSecretKey(): string {
+  const configured = Deno.env.get("SUPABASE_SECRET_KEY");
+  if (configured) return configured;
+
+  const keySet = Deno.env.get("SUPABASE_SECRET_KEYS");
+  if (keySet) {
+    try {
+      const key = JSON.parse(keySet).default;
+      if (key) return key;
+      throw new Error("SUPABASE_SECRET_KEYS.default is missing.");
+    } catch {
+      throw new Error("SUPABASE_SECRET_KEYS must be valid JSON.");
+    }
+  }
+
+  // Temporary compatibility while the project moves from legacy service_role keys.
+  const legacy = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!legacy) throw new Error("A Supabase secret key is required.");
+  return legacy;
+}
+const SUPABASE_SECRET_KEY = getSupabaseSecretKey();
 const EMAIL_WEBHOOK_SECRET = Deno.env.get("EMAIL_WEBHOOK_SECRET");
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN");
 const TELEGRAM_CONFIRM_CHAT_ID = Deno.env.get("TELEGRAM_CONFIRM_CHAT_ID");
 const DEFAULT_SUPABASE_USER_ID = Deno.env.get("DEFAULT_SUPABASE_USER_ID");
 const ALLOWED_CHAT_IDS = (Deno.env.get("ALLOWED_CHAT_IDS") ?? "").split(",").map((s)=>s.trim()).filter(Boolean);
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 
 type ParsedTransaction = {
   type: "income" | "outcome";
@@ -58,37 +78,24 @@ function normalizeTransaction(parsed: any): ParsedTransaction {
   };
 }
 
-async function getOrCreateCategory(name: string) {
-  const { data: existing } = await supabase.from("categories").select("id").ilike("name", name).maybeSingle();
-  if (existing) return existing.id;
-
-  const { data: inserted, error } = await supabase
-    .from("categories")
-    .insert({
-      name,
-      allowed_type: "both"
-    })
-    .select("id")
-    .single();
-  if (error) throw error;
-  return inserted.id;
+async function getOrCreateCategory(name: string, userId: string) {
+  const { data, error } = await supabase.rpc("backend_resolve_category", {
+    p_user_id: userId, p_name: name
+  });
+  if (error) throw new Error("Category resolution failed.");
+  return data;
 }
 
 async function getOrCreateAccount(name: string) {
-  const { data: existing } = await supabase.from("accounts").select("id").eq("name", name).maybeSingle();
-  if (existing) return existing.id;
-
-  const { data: inserted, error } = await supabase
-    .from("accounts")
-    .insert({ name })
-    .select("id")
-    .single();
-  if (error) throw error;
-  return inserted.id;
+  const { data, error } = await supabase.from("accounts")
+    .upsert({ name }, { onConflict: "name" }).select("id").single();
+  if (error) throw new Error("Account resolution failed.");
+  return data.id;
 }
 
 async function createStagingTransaction(p: ParsedTransaction) {
-  const categoryId = await getOrCreateCategory(p.categoryName);
+  const userId = requireEnv("DEFAULT_SUPABASE_USER_ID", DEFAULT_SUPABASE_USER_ID);
+  const categoryId = await getOrCreateCategory(p.categoryName, userId);
   const accountId = await getOrCreateAccount(p.accountName);
 
   const { data, error } = await supabase
@@ -100,7 +107,7 @@ async function createStagingTransaction(p: ParsedTransaction) {
       type: p.type,
       category_id: categoryId,
       account_id: accountId,
-      user_id: DEFAULT_SUPABASE_USER_ID || null,
+      user_id: userId,
       status: "pending"
     })
     .select("id")
@@ -161,7 +168,7 @@ async function sendTransactionConfirmation(stagingId: string, p: ParsedTransacti
       .eq("id", stagingId);
 
     if (error) {
-      console.error("Failed to store Telegram message metadata", error);
+      console.error("Failed to store Telegram message metadata.");
     }
   }
 }
@@ -179,7 +186,7 @@ serve(async (req) => {
     }
 
     requireEnv("SUPABASE_URL", SUPABASE_URL);
-    requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY);
+    requireEnv("SUPABASE_SECRET_KEY", SUPABASE_SECRET_KEY);
 
     const body = await req.json();
     const transaction = normalizeTransaction(body.transaction);
@@ -192,10 +199,10 @@ serve(async (req) => {
       transaction
     });
   } catch (error) {
-    console.error(error);
+    console.error("Receipt processing failed.");
     return jsonResponse({
       ok: false,
-      error: error instanceof Error ? error.message : String(error)
-    }, 200);
+      error: "Receipt processing failed."
+    }, 500);
   }
 });

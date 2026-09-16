@@ -5,7 +5,27 @@ import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm";
 // --- Secrets from Supabase dashboard ---
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+function getSupabaseSecretKey(): string {
+  const configured = Deno.env.get("SUPABASE_SECRET_KEY");
+  if (configured) return configured;
+
+  const keySet = Deno.env.get("SUPABASE_SECRET_KEYS");
+  if (keySet) {
+    try {
+      const key = JSON.parse(keySet).default;
+      if (key) return key;
+      throw new Error("SUPABASE_SECRET_KEYS.default is missing.");
+    } catch {
+      throw new Error("SUPABASE_SECRET_KEYS must be valid JSON.");
+    }
+  }
+
+  // Temporary compatibility while the project moves from legacy service_role keys.
+  const legacy = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!legacy) throw new Error("A Supabase secret key is required.");
+  return legacy;
+}
+const SUPABASE_SECRET_KEY = getSupabaseSecretKey();
 const TELEGRAM_SECRET_TOKEN = Deno.env.get("TELEGRAM_SECRET_TOKEN");
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN");
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
@@ -13,12 +33,18 @@ const OCR_METHOD = Deno.env.get("OCR_METHOD") || "openai"; // "openai", "google"
 const ALLOWED_CHAT_IDS = (Deno.env.get("ALLOWED_CHAT_IDS") ?? "").split(",").map((s)=>s.trim()).filter(Boolean);
 
 // Simple in-memory store for pending OCR confirmations
+function redactSecrets(text: string): string {
+  for (const secret of [SUPABASE_SECRET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_TOKEN, OPENAI_API_KEY]) {
+    if (secret) text = text.split(secret).join("[redacted]");
+  }
+  return text;
+}
 const pendingConfirmations = new Map<string, {
   ocrText: string;
   timestamp: number;
   imageUrl?: string;
 }>();
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 // --- Helpers ---
 // Parse Jakarta local date string "[YYYY-MM-DD HH:MM]" -> UTC Date
 function parseJakartaDate(str) {
@@ -65,26 +91,8 @@ function parseMessage(text) {
     description
   };
 }
-async function getOrCreateCategory(name) {
-  // Search case-insensitively for existing category
-  const { data: existing } = await supabase.from("categories").select("id").ilike("name", name).maybeSingle();
-  if (existing) return existing.id;
-  // all new categories default to 'both'
-  const { data: inserted, error } = await supabase.from("categories").insert({
-    name,
-    allowed_type: "both"
-  }).select("id").single();
-  if (error) throw error;
-  return inserted.id;
-}
-async function getOrCreateAccount(name) {
-  const { data: existing } = await supabase.from("accounts").select("id").eq("name", name).maybeSingle();
-  if (existing) return existing.id;
-  const { data: inserted, error } = await supabase.from("accounts").insert({
-    name
-  }).select("id").single();
-  if (error) throw error;
-  return inserted.id;
+function requireOwner(userId?: string | null): asserts userId is string {
+  if (!userId) throw new Error("An active, verified Telegram account link is required.");
 }
 // Get or create Telegram user and return Supabase user ID
 async function getTelegramUser(telegramUserId: number, telegramUsername?: string, telegramFirstName?: string, telegramLastName?: string) {
@@ -120,57 +128,6 @@ async function getTelegramUser(telegramUserId: number, telegramUsername?: string
   return null;
 }
 
-// Register Telegram user with Supabase user ID
-async function registerTelegramUser(telegramUserId: number, supabaseUserId: string, telegramUsername?: string, telegramFirstName?: string, telegramLastName?: string) {
-  // Check if Supabase user exists
-  const { data: supabaseUser, error: userError } = await supabase.auth.admin.getUserById(supabaseUserId);
-  if (userError || !supabaseUser) {
-    throw new Error("Invalid Supabase user ID. Please check your user ID.");
-  }
-  
-  // Check if Telegram user already exists
-  const { data: existing } = await supabase
-    .from("telegram_users")
-    .select("id")
-    .eq("telegram_user_id", telegramUserId)
-    .maybeSingle();
-  
-  if (existing) {
-    // Update existing record
-    const { error } = await supabase
-      .from("telegram_users")
-      .update({
-        supabase_user_id: supabaseUserId,
-        telegram_username: telegramUsername,
-        telegram_first_name: telegramFirstName,
-        telegram_last_name: telegramLastName,
-        is_active: true,
-        last_activity_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq("telegram_user_id", telegramUserId);
-    
-    if (error) throw error;
-    return "updated";
-  }
-  
-  // Create new record
-  const { error } = await supabase
-    .from("telegram_users")
-    .insert({
-      telegram_user_id: telegramUserId,
-      telegram_username: telegramUsername,
-      telegram_first_name: telegramFirstName,
-      telegram_last_name: telegramLastName,
-      supabase_user_id: supabaseUserId,
-      is_active: true,
-      last_activity_at: new Date().toISOString()
-    });
-  
-  if (error) throw error;
-  return "created";
-}
-
 // Check budget after transaction insertion
 async function checkBudgetStatus(userId: string, categoryId: string, transactionAmount: number, occurredAt: string) {
   const transactionDate = new Date(occurredAt);
@@ -185,7 +142,7 @@ async function checkBudgetStatus(userId: string, categoryId: string, transaction
     .or(`end_date.is.null,end_date.gte.${transactionDate.toISOString()}`);
   
   if (error) {
-    console.error("Error fetching budgets:", error);
+    console.error("Budget lookup failed.");
     return null;
   }
   
@@ -261,7 +218,7 @@ async function checkBudgetStatus(userId: string, categoryId: string, transaction
       .is("deleted_at", null);
     
     if (txError) {
-      console.error("Error fetching transactions for budget check:", txError);
+      console.error("Budget transaction lookup failed.");
       continue;
     }
     
@@ -308,163 +265,46 @@ async function checkBudgetStatus(userId: string, categoryId: string, transaction
   };
 }
 
-async function insertTransaction(p, userId?: string) {
-  const category_id = await getOrCreateCategory(p.categoryName);
-  const account_id = await getOrCreateAccount(p.accountName);
-  const { data, error } = await supabase.from("transactions").insert({
-    type: p.type,
-    amount: p.amount,
-    category_id,
-    account_id,
-    currency: "IDR",
-    occurred_at: p.occurred_at,
-    description: p.description,
-    user_id: userId || null
-  }).select("id").single();
-  if (error) throw error;
-  
-  // Check budget if user_id is provided and transaction is outcome
-  let budgetInfo: { alerts: string | null; progress: string | null } | null = null;
-  if (userId && p.type === "outcome") {
-    try {
-      const budgetStatus = await checkBudgetStatus(userId, category_id, p.amount, p.occurred_at);
-      // Only set budgetInfo if there's actual progress or alerts to show
-      if (budgetStatus && (budgetStatus.progress || budgetStatus.alerts)) {
-        budgetInfo = budgetStatus;
-      }
-    } catch (error) {
-      console.error("Error checking budget:", error);
-      // Don't fail the transaction if budget check fails
-    }
+async function insertTransaction(p, userId: string | undefined, updateId: number) {
+  requireOwner(userId);
+  if (!Number.isSafeInteger(updateId) || updateId < 0) throw new Error("Invalid Telegram update.");
+  const { data: id, error } = await supabase.rpc("backend_save_telegram_transaction", {
+    p_user_id: userId, p_update_id: updateId, p_transaction: p
+  });
+  if (error) throw new Error("Transaction could not be saved.");
+  let budgetInfo = null;
+  if (p.type === "outcome") {
+    const { data: txn } = await supabase.from("transactions").select("category_id")
+      .eq("id", id).eq("user_id", userId).single();
+    if (txn) budgetInfo = await checkBudgetStatus(userId, txn.category_id, p.amount, p.occurred_at).catch(() => null);
   }
-  
-  return { id: data.id, budgetInfo };
+  return { id, budgetInfo };
 }
 
+async function processStagedTransaction(stagingId: string, telegramUserId: number | undefined, action: string) {
+  if (!Number.isSafeInteger(telegramUserId)) throw new Error("Invalid Telegram sender.");
+  const { data, error } = await supabase.rpc("backend_process_staged_transaction", {
+    p_staging_id: stagingId, p_telegram_user_id: telegramUserId, p_action: action
+  });
+  if (error) throw new Error("Transaction unavailable or could not be processed.");
+  return data;
+}
 async function confirmStagedTransaction(stagingId: string, telegramUserId?: number) {
-  const now = new Date().toISOString();
-  const { data: stagingData, error: fetchError } = await supabase
-    .from("transaction_staging")
-    .select("*")
-    .eq("id", stagingId)
-    .single();
-
-  if (fetchError || !stagingData) {
-    throw new Error("Transaction not found or expired.");
+  const { stagingData, txn } = await processStagedTransaction(stagingId, telegramUserId, "confirm");
+  let budgetStatus = null;
+  if (txn?.type === "outcome") {
+    budgetStatus = await checkBudgetStatus(txn.user_id, txn.category_id, txn.amount, txn.occurred_at)
+      .catch(() => null);
   }
-  if (stagingData.status !== "pending") {
-    throw new Error(`Already ${stagingData.status}.`);
-  }
-
-  const { data: claimedRows, error: claimError } = await supabase
-    .from("transaction_staging")
-    .update({
-      status: "confirmed",
-      confirmed_at: now
-    })
-    .eq("id", stagingId)
-    .eq("status", "pending")
-    .select("id");
-
-  if (claimError) {
-    console.error("Confirm claim error", claimError);
-    throw new Error("Failed to confirm transaction.");
-  }
-  if (!claimedRows?.length) {
-    throw new Error("Already processed.");
-  }
-
-  let targetUserId = stagingData.user_id;
-  if (!targetUserId && telegramUserId) {
-    try {
-      const uid = await getTelegramUser(telegramUserId);
-      if (uid) targetUserId = uid;
-    } catch (error) {
-      console.log("User lookup failed", error);
-    }
-  }
-  if (!targetUserId && DEFAULT_SUPABASE_USER_ID) {
-    targetUserId = DEFAULT_SUPABASE_USER_ID;
-  }
-
-  const { data: txn, error: insertError } = await supabase
-    .from("transactions")
-    .insert({
-      amount: stagingData.amount,
-      description: stagingData.description,
-      occurred_at: stagingData.occurred_at,
-      type: stagingData.type || "outcome",
-      category_id: stagingData.category_id || (await getOrCreateCategory("Uncategorized")),
-      account_id: stagingData.account_id || (await getOrCreateAccount("Bank")),
-      user_id: targetUserId,
-      currency: stagingData.currency || "IDR"
-    })
-    .select()
-    .single();
-
-  if (insertError) {
-    console.error("Insert Error", insertError);
-    await supabase
-      .from("transaction_staging")
-      .update({
-        status: "pending",
-        confirmed_at: null
-      })
-      .eq("id", stagingId)
-      .eq("status", "confirmed")
-      .eq("confirmed_at", now);
-    throw new Error("Failed to save transaction.");
-  }
-
-  let budgetStatus: { alerts: string | null; progress: string | null } | null = null;
-  if (targetUserId && txn.type === "outcome") {
-    try {
-      budgetStatus = await checkBudgetStatus(targetUserId, txn.category_id, txn.amount, txn.occurred_at);
-    } catch (error) {
-      console.error("Budget check error", error);
-    }
-  }
-
   return { stagingData, txn, budgetStatus };
 }
-
-async function rejectStagedTransaction(stagingId: string) {
-  const now = new Date().toISOString();
-  const { data: stagingData, error: fetchError } = await supabase
-    .from("transaction_staging")
-    .select("*")
-    .eq("id", stagingId)
-    .single();
-
-  if (fetchError || !stagingData) {
-    throw new Error("Transaction not found or expired.");
-  }
-  if (stagingData.status !== "pending") {
-    throw new Error(`Already ${stagingData.status}.`);
-  }
-
-  const { data: rejectedRows, error: rejectError } = await supabase
-    .from("transaction_staging")
-    .update({
-      status: "rejected",
-      rejected_at: now
-    })
-    .eq("id", stagingId)
-    .eq("status", "pending")
-    .select("id");
-
-  if (rejectError) {
-    console.error("Reject error", rejectError);
-    throw new Error("Failed to reject transaction.");
-  }
-  if (!rejectedRows?.length) {
-    throw new Error("Already processed.");
-  }
-
+async function rejectStagedTransaction(stagingId: string, telegramUserId?: number) {
+  const { stagingData } = await processStagedTransaction(stagingId, telegramUserId, "reject");
   return stagingData;
 }
 
-async function findStagingIdForTelegramReply(replyMessage: any) {
+async function findStagingIdForTelegramReply(replyMessage: any, userId: string) {
+  requireOwner(userId);
   const replyMessageId = replyMessage?.message_id;
   const replyChatId = replyMessage?.chat?.id;
 
@@ -475,6 +315,7 @@ async function findStagingIdForTelegramReply(replyMessage: any) {
   const { data, error } = await supabase
     .from("transaction_staging")
     .select("id")
+    .eq("user_id", userId)
     .contains("metadata", {
       telegram_chat_id: String(replyChatId),
       telegram_message_id: replyMessageId
@@ -488,6 +329,7 @@ async function findStagingIdForTelegramReply(replyMessage: any) {
   return data?.[0]?.id || null;
 }
 async function replyToTelegram(chatId, text) {
+  text = redactSecrets(text);
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   await fetch(url, {
     method: "POST",
@@ -500,33 +342,6 @@ async function replyToTelegram(chatId, text) {
       parse_mode: "HTML"
     })
   });
-}
-
-async function repairTelegramWebhook() {
-  if (!SUPABASE_URL || !TELEGRAM_BOT_TOKEN || !TELEGRAM_SECRET_TOKEN) {
-    throw new Error("Telegram webhook secrets are incomplete.");
-  }
-
-  const webhookUrl = `${SUPABASE_URL}/functions/v1/telegram-webhook`;
-  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      url: webhookUrl,
-      secret_token: TELEGRAM_SECRET_TOKEN,
-      allowed_updates: ["message", "edited_message", "callback_query"],
-      drop_pending_updates: false
-    })
-  });
-  const payload = await response.json();
-
-  if (!response.ok || !payload?.ok) {
-    throw new Error(payload?.description || `Telegram setWebhook failed with status ${response.status}.`);
-  }
-
-  return webhookUrl;
 }
 
 // Parse date input for outcome commands
@@ -664,6 +479,7 @@ function getMonthName(monthNumber) {
 
 // Query outcomes for a specific period
 async function queryOutcomes(dateParams, userId?: string) {
+  requireOwner(userId);
   let query = supabase
     .from("transactions")
     .select(`
@@ -771,6 +587,7 @@ function formatOutcomeReport(outcomes, dateParams) {
 
 // Query monthly summary for specific months
 async function querySummaryData(months, userId?: string) {
+  requireOwner(userId);
   const summaries: any[] = [];
   
   for (const { year, month } of months) {
@@ -906,6 +723,7 @@ function formatSummaryReport(summaries) {
 
 // --- Main handler ---
 serve(async (req)=>{
+  if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
   try {
     const secret = req.headers.get("x-telegram-bot-api-secret-token");
     if (!secret || secret !== TELEGRAM_SECRET_TOKEN) {
@@ -914,6 +732,7 @@ serve(async (req)=>{
       });
     }
     const update = await req.json();
+    if (!Number.isSafeInteger(update.update_id) || update.update_id < 0) return new Response("Invalid update", { status: 400 });
 
     // Handle inline Confirm / Reject buttons from staged email or receipt transactions.
     if (update.callback_query) {
@@ -954,6 +773,11 @@ serve(async (req)=>{
           return new Response("ok");
         }
 
+        if (message?.chat?.type !== "private" || !Number.isSafeInteger(from?.id)) {
+          await answerCallback("Use a private chat with the bot.");
+          return new Response("ok");
+        }
+
         if (!stagingId) {
           await answerCallback("Invalid transaction data.");
           return new Response("ok");
@@ -983,7 +807,7 @@ serve(async (req)=>{
         }
 
         if (action === "reject") {
-          const stagingData = await rejectStagedTransaction(stagingId);
+          const stagingData = await rejectStagedTransaction(stagingId, from?.id);
           await editMessageText(`❌ <b>Rejected</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${stagingData.description}`);
           console.log("Telegram callback completed", {
             action,
@@ -996,7 +820,7 @@ serve(async (req)=>{
         await answerCallback("Unknown action.");
         return new Response("ok");
       } catch (error) {
-        console.error("Callback query error", error);
+        console.error("Callback query failed.");
         const errorMessage = error instanceof Error ? error.message.slice(0, 500) : "Failed to process callback.";
         if (message?.chat?.id) {
           await replyToTelegram(
@@ -1008,7 +832,7 @@ serve(async (req)=>{
       }
     }
     
-    const message = update?.message ?? update?.edited_message;
+    const message = update?.message;
     if (!message) return new Response("ok");
     const chatId = String(message.chat?.id ?? "");
     if (ALLOWED_CHAT_IDS.length && !ALLOWED_CHAT_IDS.includes(chatId)) {
@@ -1035,35 +859,29 @@ serve(async (req)=>{
         );
       } catch (error) {
         // User not registered or error - will be handled per command
-        console.log("Telegram user not registered or error:", error);
+        console.log("Telegram sender mapping unavailable.");
       }
     }
     
     const text = message.text;
     if (!text) return new Response("ok");
-
-    if (/^\/repair_webhook(?:@\w+)?(?:\s+|$)/i.test(text)) {
-      try {
-        const webhookUrl = await repairTelegramWebhook();
-        console.log("Telegram webhook repaired", {
-          webhookUrl,
-          allowedUpdates: ["message", "edited_message", "callback_query"]
-        });
-        await replyToTelegram(
-          chatId,
-          "✅ Telegram webhook repaired. Confirm and Reject buttons are enabled for new and existing alerts."
-        );
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Failed to repair Telegram webhook.";
-        console.error("Telegram webhook repair error", error);
-        await replyToTelegram(chatId, `❌ Telegram webhook repair failed: ${errorMessage}`);
-      }
+    if (/^\/register/i.test(text)) {
+      await replyToTelegram(chatId, "Account linking by user ID is disabled. Contact the administrator to verify your account link.");
+      return new Response("ok");
+    }
+    if (!supabaseUserId) {
+      await replyToTelegram(chatId, "An active, verified account link is required. Contact the administrator.");
+      return new Response("ok");
+    }
+    if (message.chat?.type !== "private") {
+      await replyToTelegram(chatId, "Use a private chat with the bot for financial operations.");
       return new Response("ok");
     }
 
+
     // Confirm all pending staged receipt transactions.
     if (/^\/(confirm_all|confirmall)(?:\s+|$)/i.test(text)) {
-      const targetUserId = supabaseUserId || DEFAULT_SUPABASE_USER_ID;
+      const targetUserId = supabaseUserId;
       const limitMatch = text.match(/\s+(\d+)\s*$/);
       const limit = Math.min(Math.max(Number(limitMatch?.[1] || 25), 1), 100);
 
@@ -1079,14 +897,6 @@ serve(async (req)=>{
       }
 
       let { data: stagedRows, error: stagedError } = await query;
-      if (!stagedRows?.length && targetUserId && !stagedError) {
-        ({ data: stagedRows, error: stagedError } = await supabase
-          .from("transaction_staging")
-          .select("id")
-          .eq("status", "pending")
-          .order("created_at", { ascending: true })
-          .limit(limit));
-      }
 
       if (stagedError) {
         await replyToTelegram(chatId, `❌ Could not load pending transactions: ${stagedError.message}`);
@@ -1125,7 +935,7 @@ ${failures.slice(0, 5).join("\n")}`;
 
     // Reject all pending staged receipt transactions.
     if (/^\/(reject_all|rejectall)(?:\s+|$)/i.test(text)) {
-      const targetUserId = supabaseUserId || DEFAULT_SUPABASE_USER_ID;
+      const targetUserId = supabaseUserId;
       const limitMatch = text.match(/\s+(\d+)\s*$/);
       const limit = Math.min(Math.max(Number(limitMatch?.[1] || 25), 1), 100);
 
@@ -1141,14 +951,6 @@ ${failures.slice(0, 5).join("\n")}`;
       }
 
       let { data: stagedRows, error: stagedError } = await query;
-      if (!stagedRows?.length && targetUserId && !stagedError) {
-        ({ data: stagedRows, error: stagedError } = await supabase
-          .from("transaction_staging")
-          .select("id")
-          .eq("status", "pending")
-          .order("created_at", { ascending: true })
-          .limit(limit));
-      }
 
       if (stagedError) {
         await replyToTelegram(chatId, `❌ Could not load pending transactions: ${stagedError.message}`);
@@ -1163,7 +965,7 @@ ${failures.slice(0, 5).join("\n")}`;
       const failures: string[] = [];
       for (const row of stagedRows) {
         try {
-          await rejectStagedTransaction(row.id);
+          await rejectStagedTransaction(row.id, telegramUserId);
           rejected += 1;
         } catch (error) {
           failures.push(`${row.id}: ${error.message}`);
@@ -1190,14 +992,14 @@ ${failures.slice(0, 5).join("\n")}`;
     if (/^(confirm|yes|y|reject|no|n)$/i.test(normalizedText)) {
       const isReject = /^(reject|no|n)$/i.test(normalizedText);
       try {
-        const stagingId = await findStagingIdForTelegramReply(message.reply_to_message);
+        const stagingId = await findStagingIdForTelegramReply(message.reply_to_message, supabaseUserId);
         if (!stagingId) {
           await replyToTelegram(chatId, `Reply to the receipt alert you want to ${isReject ? "reject" : "confirm"}.`);
           return new Response("ok");
         }
 
         if (isReject) {
-          const stagingData = await rejectStagedTransaction(stagingId);
+          const stagingData = await rejectStagedTransaction(stagingId, telegramUserId);
           await replyToTelegram(chatId, `❌ Rejected
 Amount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR
 Desc: ${stagingData.description}`);
@@ -1225,7 +1027,7 @@ ${budgetStatus.alerts}`;
         console.error("Telegram reply action error", {
           action: isReject ? "reject" : "confirm",
           chatId,
-          error: errorMessage
+          error: redactSecrets(errorMessage)
         });
         await replyToTelegram(chatId, `❌ Failed to ${isReject ? "reject" : "confirm"} transaction: ${errorMessage}`);
         return new Response("ok");
@@ -1248,7 +1050,7 @@ ${budgetStatus.alerts}`;
             accountName: p.account,
             occurred_at: p.occurred_at,
             description: p.description
-          }, supabaseUserId || undefined);
+          }, supabaseUserId || undefined, update.update_id);
           
           // Format reply with Jakarta local time
           const when = new Date(p.occurred_at).toLocaleString("en-GB", {
@@ -1294,7 +1096,7 @@ ${budgetStatus.alerts}`;
             accountName: p.account,
             occurred_at: p.occurred_at,
             description: p.description
-          }, supabaseUserId || undefined);
+          }, supabaseUserId || undefined, update.update_id);
           
           // Format reply with Jakarta local time
           const when = new Date(p.occurred_at).toLocaleString("en-GB", {
@@ -1331,7 +1133,7 @@ ${budgetStatus.alerts}`;
       const helpText = `👋 <b>Financial Tracker Bot</b>
 
 <b>🔐 Registration:</b>
-/register &lt;supabase_user_id&gt; - Link your Telegram account to Supabase
+Account linking: contact the administrator for verification.
 
 <b>📝 Record Transaction:</b>
 <code>outcome 75000 Food BCA [YYYY-MM-DD HH:MM] Lunch</code>
@@ -1354,40 +1156,6 @@ Send a photo of receipt/transaction and I'll extract the text for you to confirm
 <b>Format:</b> &lt;type&gt; &lt;amount&gt; &lt;Category&gt; &lt;Account&gt; [optional date] &lt;description&gt;`;
       await replyToTelegram(chatId, helpText);
       return new Response("ok");
-    }
-
-    // Handle /register command
-    if (/^\/register/i.test(text)) {
-      try {
-        if (!telegramUserId) {
-          await replyToTelegram(chatId, "❌ Unable to identify Telegram user. Please try again.");
-          return new Response("ok");
-        }
-        
-        const args = text.substring(9).trim(); // Remove "/register" prefix
-        if (!args) {
-          await replyToTelegram(chatId, "❌ Please provide your Supabase user ID.\n\nUsage: /register &lt;supabase_user_id&gt;\n\nYou can find your user ID in your Supabase dashboard.");
-          return new Response("ok");
-        }
-        
-        const result = await registerTelegramUser(
-          telegramUserId,
-          args,
-          telegramUsername,
-          telegramFirstName,
-          telegramLastName
-        );
-        
-        if (result === "created") {
-          await replyToTelegram(chatId, `✅ <b>Registration Successful!</b>\n\nYour Telegram account has been linked to your Supabase account.\n\nYou can now use all features including budget tracking.`);
-        } else {
-          await replyToTelegram(chatId, `✅ <b>Account Updated!</b>\n\nYour Telegram account information has been updated.`);
-        }
-        return new Response("ok");
-      } catch (error) {
-        await replyToTelegram(chatId, `❌ Registration failed: ${error.message}\n\nPlease check your Supabase user ID and try again.`);
-        return new Response("ok");
-      }
     }
 
     // Handle /outcome command
@@ -1430,7 +1198,7 @@ Send a photo of receipt/transaction and I'll extract the text for you to confirm
         accountName: p.account,
         occurred_at: p.occurred_at,
         description: p.description
-      }, supabaseUserId || undefined);
+      }, supabaseUserId || undefined, update.update_id);
       // Format reply with Jakarta local time
       const when = new Date(p.occurred_at).toLocaleString("en-GB", {
         timeZone: "Asia/Jakarta",
@@ -1467,10 +1235,10 @@ Send a photo of receipt/transaction and I'll extract the text for you to confirm
       return new Response("ok");
     }
   } catch (e) {
-    console.error(e);
+    console.error("Telegram webhook failed.");
     return new Response(JSON.stringify({
       ok: false,
-      error: String(e)
+      error: "Telegram webhook failed."
     }), {
       status: 200,
       headers: {
