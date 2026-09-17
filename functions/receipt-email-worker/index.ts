@@ -136,7 +136,8 @@ async function sendTransactionConfirmation(stagingId: string, p: ParsedTransacti
     timeZone: "Asia/Jakarta",
     hour12: false
   });
-  const sourceLine = source?.subject ? `\nEmail: ${String(source.subject).slice(0, 120)}` : "";
+  const escapeHtml = (value: unknown) => String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const sourceLine = source?.subject ? `\nEmail: ${escapeHtml(String(source.subject).slice(0, 120))}` : "";
 
   const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -146,12 +147,16 @@ async function sendTransactionConfirmation(stagingId: string, p: ParsedTransacti
     body: JSON.stringify({
       chat_id: confirmationChatId,
       parse_mode: "HTML",
-      text: `📧 <b>Email receipt detected</b>\n\nType: ${p.type}\nAmount: ${p.amount.toLocaleString("id-ID")} IDR\nCategory: ${p.categoryName}\nAccount: ${p.accountName}\nWhen: ${when}\nDescription: ${p.description}${sourceLine}\n\nSave this transaction?`,
+      text: `📧 <b>Email receipt detected</b>\n\nType: ${p.type}\nAmount: ${p.amount.toLocaleString("id-ID")} IDR\nCategory: ${escapeHtml(p.categoryName)}\nAccount: ${escapeHtml(p.accountName)}\nWhen: ${when}\nDescription: ${escapeHtml(p.description)}${sourceLine}\n\nReview the category and account, then confirm to save.`,
       reply_markup: {
         inline_keyboard: [
           [
             { text: "✅ Confirm", callback_data: `confirm:${stagingId}` },
             { text: "❌ Reject", callback_data: `reject:${stagingId}` }
+          ],
+          [
+            { text: "Edit category", callback_data: `ec:${stagingId}:0` },
+            { text: "Edit account", callback_data: `ea:${stagingId}:0` }
           ]
         ]
       }

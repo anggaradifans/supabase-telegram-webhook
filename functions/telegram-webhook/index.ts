@@ -313,6 +313,68 @@ async function rejectStagedTransaction(stagingId: string, telegramUserId?: numbe
   return stagingData;
 }
 
+function escapeHtml(value: unknown) {
+  return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Two UUIDs must fit inside Telegram's 64-byte callback_data limit.
+function compactId(uuid: string) {
+  return btoa(String.fromCharCode(...uuid.replace(/-/g, "").match(/../g)!.map(h => parseInt(h, 16))))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function expandId(value: string) {
+  if (!/^[A-Za-z0-9_-]{22}$/.test(value)) throw new Error("Invalid selection.");
+  const hex = Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=="))
+    .map(c => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function reviewKeyboard(stagingId: string) {
+  return { inline_keyboard: [
+    [{ text: "✅ Confirm", callback_data: `confirm:${stagingId}` }, { text: "❌ Reject", callback_data: `reject:${stagingId}` }],
+    [{ text: "Edit category", callback_data: `ec:${stagingId}:0` }, { text: "Edit account", callback_data: `ea:${stagingId}:0` }]
+  ] };
+}
+
+function revisionMessage(result: any, action: string) {
+  const p = result.stagingData;
+  const when = new Date(p.occurred_at).toLocaleString("en-GB", { timeZone: "Asia/Jakarta", hour12: false });
+  let text = `<b>Review transaction</b>\n\nType: ${escapeHtml(p.type)}\nAmount: ${Number(p.amount).toLocaleString("id-ID")} ${escapeHtml(p.currency || "IDR")}\nCategory: ${escapeHtml(result.categoryName || "Uncategorized")}\nAccount: ${escapeHtml(result.accountName || "Bank")}\nWhen: ${when}\nDescription: ${escapeHtml(p.description)}`;
+  if (p.metadata?.email_subject) text += `\nEmail: ${escapeHtml(String(p.metadata.email_subject).slice(0, 120))}`;
+  if (action !== "ec" && action !== "ea") {
+    return { text: text + "\n\nReview the category and account, then confirm to save.", reply_markup: reviewKeyboard(p.id) };
+  }
+  const isCategory = action === "ec";
+  const currentId = isCategory ? p.category_id : p.account_id;
+  const choices = result.choices || [];
+  const keyboard = choices.slice(0, 8).map((choice: any) => [{
+    text: `${choice.id === currentId ? "✓ " : ""}${choice.name}`,
+    callback_data: `${isCategory ? "sc" : "sa"}:${compactId(p.id)}:${compactId(choice.id)}`
+  }]);
+  const navigation = [];
+  if (result.page > 0) navigation.push({ text: "Previous", callback_data: `${action}:${p.id}:${result.page - 1}` });
+  if (choices.length > 8) navigation.push({ text: "Next", callback_data: `${action}:${p.id}:${result.page + 1}` });
+  if (navigation.length) keyboard.push(navigation);
+  keyboard.push([{ text: "Back to review", callback_data: `review:${p.id}` }]);
+  text += choices.length ? `\n\nChoose ${isCategory ? "a category" : "an account"} (page ${result.page + 1}).` : "\n\nNo available choices on this page.";
+  return { text, reply_markup: { inline_keyboard: keyboard } };
+}
+
+async function reviseStagedTransaction(action: string, id: string, selection: string | undefined, telegramUserId: number) {
+  const selecting = action === "sc" || action === "sa";
+  const stagingId = selecting ? expandId(id) : id;
+  const page = action === "ec" || action === "ea" ? Number(selection || 0) : 0;
+  if (!Number.isSafeInteger(page) || page < 0 || page > 10000) throw new Error("Invalid page.");
+  const actions = { ec: "categories", ea: "accounts", sc: "category", sa: "account", review: "view" };
+  const { data, error } = await supabase.rpc("backend_revise_staged_transaction", {
+    p_staging_id: stagingId, p_telegram_user_id: telegramUserId, p_action: actions[action],
+    p_choice_id: selecting ? expandId(selection || "") : null, p_page: page
+  });
+  if (error || !data) throw new Error("Receipt unavailable, already processed, or selection no longer valid. Reopen the receipt to review it.");
+  return revisionMessage(data, action);
+}
+
 async function findStagingIdForTelegramReply(replyMessage: any, userId: string) {
   requireOwner(userId);
   const replyMessageId = replyMessage?.message_id;
@@ -747,7 +809,7 @@ serve(async (req)=>{
     // Handle inline Confirm / Reject buttons from staged email or receipt transactions.
     if (update.callback_query) {
       const { id, data, message, from } = update.callback_query;
-      const [action, stagingId] = (data || "").split(":");
+      const [action, stagingId, selection] = (data || "").split(":");
       const callbackChatId = String(message?.chat?.id ?? "");
 
       console.log("Telegram callback received", {
@@ -764,17 +826,22 @@ serve(async (req)=>{
         });
       };
 
-      const editMessageText = async (text: string) => {
-        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`, {
+      const editMessageText = async (text: string, replyMarkup = { inline_keyboard: [] }) => {
+        const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             chat_id: message?.chat?.id,
             message_id: message?.message_id,
             text,
-            parse_mode: "HTML"
+            parse_mode: "HTML",
+            reply_markup: replyMarkup
           })
         });
+        const payload = await response.json();
+        if (!payload.ok && !String(payload.description).includes("message is not modified")) {
+          throw new Error("Could not refresh the Telegram receipt. Reopen it before confirming.");
+        }
       };
 
       try {
@@ -793,13 +860,20 @@ serve(async (req)=>{
           return new Response("ok");
         }
 
+        if (["ec", "ea", "sc", "sa", "review"].includes(action)) {
+          await answerCallback("Loading receipt...");
+          const revised = await reviseStagedTransaction(action, stagingId, selection, from.id);
+          await editMessageText(revised.text, revised.reply_markup);
+          return new Response("ok");
+        }
+
         if (action === "confirm" || action === "reject") {
           await answerCallback(`Processing ${action}...`);
         }
 
         if (action === "confirm") {
           const { stagingData, budgetStatus } = await confirmStagedTransaction(stagingId, from?.id);
-          await editMessageText(`✅ <b>Confirmed & Saved</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${stagingData.description}`);
+          await editMessageText(`✅ <b>Confirmed &amp; Saved</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${escapeHtml(stagingData.description)}`);
 
           console.log("Telegram callback completed", {
             action,
@@ -818,7 +892,7 @@ serve(async (req)=>{
 
         if (action === "reject") {
           const stagingData = await rejectStagedTransaction(stagingId, from?.id);
-          await editMessageText(`❌ <b>Rejected</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${stagingData.description}`);
+          await editMessageText(`❌ <b>Rejected</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${escapeHtml(stagingData.description)}`);
           console.log("Telegram callback completed", {
             action,
             stagingId,
@@ -835,7 +909,7 @@ serve(async (req)=>{
         if (message?.chat?.id) {
           await replyToTelegram(
             message.chat.id,
-            `❌ Failed to ${action === "reject" ? "reject" : "confirm"} transaction: ${errorMessage}`
+            `❌ Could not process this receipt: ${escapeHtml(errorMessage)}`
           );
         }
         return new Response("ok");
