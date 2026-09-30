@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
+const {pathToFileURL} = require('node:url');
 const ts = require('../../../supabase-registration/node_modules/typescript');
 function load(name, options = {}) {
   const calls = [], messages = [];
@@ -79,7 +80,7 @@ test('reply confirmations and rejections carry sender mapping',async()=>{
  }
 });
 test('PDF importer scopes duplicate search and category creation to configured owner',async()=>{
- const source=fs.readFileSync(path.join(__dirname,'../../scripts/import-jenius-pdf.mjs'),'utf8');
+ const source=fs.readFileSync(path.join(__dirname,'../../scripts/import-bank-pdf.mjs'),'utf8');
  const section=source.slice(source.indexOf('async function getOrCreateAccount('),source.indexOf('async function sendTelegramConfirmation('));
  const calls=[];
  const owner='00000000-0000-0000-0000-000000000002';
@@ -89,6 +90,38 @@ test('PDF importer scopes duplicate search and category creation to configured o
  assert.equal(JSON.parse(calls[0][1].body).p_user_id,owner);
  assert.ok(calls.some(([p])=>p.includes('user_id=eq.'+owner)));
  const write=calls.find(([p])=>p==='transaction_staging?select=id');assert.equal(JSON.parse(write[1].body).user_id,owner);
+ assert.match(source,/callback_data: `ec:\$\{stagingId\}:0`/);
+ assert.match(source,/callback_data: `ea:\$\{stagingId\}:0`/);
+});
+test('Mandiri multiline remarks after a completed row belong to the next transaction',async()=>{
+ const importer=await import(pathToFileURL(path.join(__dirname,'../../scripts/import-bank-pdf.mjs')));
+ const text=`No Date Remarks Amount (IDR) Balance (IDR)\n01 Sep 2026\n1 Biaya transfer BI Fast -2.500,00 3.393.720,33\n09:15:12 WIB\nTransfer BI Fast\n01 Sep 2026\n2 Ke BANK BNI -1.700.000,00 1.693.720,33\n09:15:12 WIB\n<nama> <rekening>\n04 Sep 2026\n3 Biaya transaksi bank -3.000,00 1.690.720,33\nPembayaran Tokopedia\n10:00:00 WIB\n04 Sep 2026\n4 887080817196444 04 Sep 2026 Pembayaran Tokopedia 887080817196444 -504.100,00 1.186.620,33\n10:00:00 WIB`;
+ const rows=importer.parseMandiriTransactions(text,'mandiri.pdf');
+ assert.equal(rows.length,4);
+ assert.equal(rows[0].description,'Biaya transfer BI Fast');
+ assert.equal(rows[1].description,'Transfer BI Fast Ke BANK BNI <nama> <rekening>');
+ assert.equal(rows[2].description,'Biaya transaksi bank');
+ assert.equal(rows[3].description,'887080817196444 Pembayaran Tokopedia');
+});
+test('Mandiri fee pairs, shared-line dates and page boilerplate stay out of descriptions',async()=>{
+ const importer=await import(pathToFileURL(path.join(__dirname,'../../scripts/import-bank-pdf.mjs')));
+ const text=`No Date Remarks Amount (IDR) Balance (IDR)\n02 Sep 2026\n2 Biaya administrasi kartu debit -9.000,00 1.684.720,33\n05:38:59 WIB\nBiaya transaksi bank\n04 Sep 2026\n3 -3.000,00 1.681.720,33\nPembayaran Tokopedia\n88708081719xxxx\nPembayaran Tokopedia\n09:00:00 WIB\n04 Sep 2026\n4 88708081719xxxx -504.100,00 1.177.620,33\n09:00:00 WIB\nTransfer BI Fast\n05 Sep 2026 Dari SEABANK INDONESIA + YOHANA FANEND MANIPR 9018281xxxxx Brown Onedp\n5 200.000,00 1.377.620,33\n10:00:00 WIB\nPembayaran Telkom/Indihome\nPT Bank Mandiri (Persero) Tbk. berizin dan diawasi oleh Otoritas Jasa Keuangan (OJK) dan Bank Indonesia (BI), Mandiri Call 14000 serta merupakan peserta penjamin Lembaga Penjamin Simpanan (LPS) e-Statement\n09 Sep 2026\n6 1431321xxxxx -3.000,00 1.374.620,33\n11:00:00 WIB`;
+ const rows=importer.parseMandiriTransactions(text,'mandiri.pdf');
+ assert.deepEqual(rows.map(row=>row.description),[
+  'Biaya administrasi kartu debit',
+  'Biaya transaksi bank',
+  'Pembayaran Tokopedia 88708081719xxxx',
+  'Transfer BI Fast Dari SEABANK INDONESIA + YOHANA FANEND MANIPR 9018281xxxxx Brown Onedp',
+  'Pembayaran Telkom/Indihome 1431321xxxxx'
+ ]);
+ assert.equal(rows[3].metadata.transaction_date,'2026-09-05');
+});
+test('Mandiri final-page Livin disclaimers stay out of descriptions',async()=>{
+ const importer=await import(pathToFileURL(path.join(__dirname,'../../scripts/import-bank-pdf.mjs')));
+ const text=`No Date Remarks Amount (IDR) Balance (IDR)\n20 Sep 2026\n15 Pembayaran GoPay Customer 081719xxxx -300.000,00 1.000.000,00\n12:00:00 WIB\nini adalah batas akhir transaksi anda Disclaimer from Bank Mandiri. Customer role responsibility.\n4. Nasabah tunduk dan terikat pada Syarat dan Ketentuan Livin yang dapat diakses melalui laman resmi Bank Mandiri.\nCustomers are subject to and bound by the Livin Term and Conditions.`;
+ const rows=importer.parseMandiriTransactions(text,'mandiri.pdf');
+ assert.equal(rows.length,1);
+ assert.equal(rows[0].description,'Pembayaran GoPay Customer 081719xxxx');
 });
 
 const stagedId = '30000000-0000-0000-0000-000000000001';

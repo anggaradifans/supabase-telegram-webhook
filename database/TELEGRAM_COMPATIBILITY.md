@@ -38,7 +38,7 @@ Original line numbers below refer to the downloaded deployment/original Git HEAD
 
 | Finding in deployed source | Local preparation |
 | --- | --- |
-| Telegram lines 68–78 and receipt lines 61–75 use unrestricted `ilike(name).maybeSingle()`, ignore lookup errors, and insert categories without owners. PDF lines 347–358 use unrestricted name lookup with `limit=1`. | [Category resolver](/Users/22070064/Documents/Tilaka/supabase/database/20260915_backend_compatibility.sql:6), [receipt caller](/Users/22070064/Documents/Tilaka/supabase/functions/receipt-email-worker/index.ts:61), and [PDF caller](/Users/22070064/Documents/Tilaka/supabase/scripts/import-jenius-pdf.mjs:363) use a service-only SQL function. |
+| Telegram lines 68–78 and receipt lines 61–75 use unrestricted `ilike(name).maybeSingle()`, ignore lookup errors, and insert categories without owners. PDF lines 347–358 use unrestricted name lookup with `limit=1`. | [Category resolver](/Users/22070064/Documents/Tilaka/supabase/database/20260915_backend_compatibility.sql:6), [receipt caller](/Users/22070064/Documents/Tilaka/supabase/functions/receipt-email-worker/index.ts:61), and [PDF caller](/Users/22070064/Documents/Tilaka/supabase/scripts/import-bank-pdf.mjs:363) use a service-only SQL function. |
 | `/register` checks whether a supplied Supabase UUID exists, then links or replaces the Telegram mapping without proof of account ownership (Telegram lines 124–172 and 1359–1395). | [Handler](/Users/22070064/Documents/Tilaka/supabase/functions/telegram-webhook/index.ts:849) disables UUID-based registration. Existing active mappings must be independently verified before deployment. Frontend registration remains unchanged and creates no Telegram profile. |
 | Unlinked users can reach reports without an owner filter; direct transaction writes allow NULL owners (Telegram lines 311–324, 666–681, 773–791). | [Transactions](/Users/22070064/Documents/Tilaka/supabase/functions/telegram-webhook/index.ts:248) require mapped ownership; [reports](/Users/22070064/Documents/Tilaka/supabase/functions/telegram-webhook/index.ts:461) reject missing ownership. Financial operations require private chats to avoid disclosing records in a shared chat. |
 | Staging confirmation/rejection fetches by ID without checking the sender's ownership. Bulk commands fall back to all pending rows when the user's queue is empty (Telegram lines 344–464 and 1064–1188). | [Atomic staging function](/Users/22070064/Documents/Tilaka/supabase/database/20260915_backend_compatibility.sql:40) resolves the active sender mapping, locks only that owner's staging row, validates its category, and atomically saves the transaction and status. Both callback and reply paths use it. Bulk fallback is removed. |
@@ -71,7 +71,7 @@ Run from the `supabase` repository:
 ```sh
 python3 database/tests/run.py
 node --test database/tests/handlers.test.cjs
-node --check scripts/import-jenius-pdf.mjs
+node --check scripts/import-bank-pdf.mjs
 ```
 
 - Disposable PostgreSQL checks passed: two owners with identically named categories; shared defaults; private/default name collision; literal wildcard names; ambiguous spelling rejection; transaction and budget creation; cross-user category rejection; foreign/inactive sender rejection; confirmation/rejection retries; and rollback on the audited production type trigger's failure.
