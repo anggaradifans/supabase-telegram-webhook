@@ -1,0 +1,49 @@
+name: Deploy Supabase functions
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let two deploys race; queue the second one instead of cancelling the first.
+concurrency:
+  group: deploy-supabase-functions
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # workflow_dispatch can be pointed at any branch; only main may reach production.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Create a personal access token at https://supabase.com/dashboard/account/tokens
+      # and store it as the SUPABASE_ACCESS_TOKEN repository secret.
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_REF: csyudifshyrxksebhlma
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.122.0
+
+      # The repo keeps functions in ./functions, but the CLI only looks in ./supabase/functions.
+      - name: Lay out functions where the CLI expects them
+        run: |
+          mkdir -p supabase/functions
+          cp -R functions/. supabase/functions/
+
+      # Both functions authenticate their own callers (Telegram secret token, email webhook
+      # secret) and are live with verify_jwt=false. Omitting --no-verify-jwt would turn gateway
+      # JWT verification back on and make Telegram and Cloudflare get 401s.
+      # telegram-webhook goes first: database/STAGED_TRANSFERS.md and STAGING_REVISION.md
+      # require its button handlers to exist before receipt-email-worker sends the new buttons.
+      - name: Deploy telegram-webhook
+        run: supabase functions deploy telegram-webhook --no-verify-jwt --use-api --project-ref "$SUPABASE_PROJECT_REF"
+
+      - name: Deploy receipt-email-worker
+        run: supabase functions deploy receipt-email-worker --no-verify-jwt --use-api --project-ref "$SUPABASE_PROJECT_REF"
