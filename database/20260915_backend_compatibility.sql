@@ -1,4 +1,7 @@
 -- Apply only after supabase-registration/database/migrations/20260915_browser_rls.sql.
+-- PARTLY SUPERSEDED: backend_process_staged_transaction and the backend_transaction_category_owner trigger
+-- are now redefined by financial-tracker-dashboard supabase/migrations/20261031110000 and 20261031120000
+-- (own-account transfers). Do not re-run this file on a database that has them. See STAGED_TRANSFERS.md.
 BEGIN;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '60s';

@@ -4,7 +4,7 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
 const {pathToFileURL} = require('node:url');
-const ts = require('../../../supabase-registration/node_modules/typescript');
+const ts = require('../../../financial-tracker-dashboard/node_modules/typescript');
 function load(name, options = {}) {
   const calls = [], messages = [];
   const env = {SUPABASE_URL:'https://example.invalid', SUPABASE_SERVICE_ROLE_KEY:'test-server-key', TELEGRAM_SECRET_TOKEN:'test-webhook', EMAIL_WEBHOOK_SECRET:'test-email', TELEGRAM_BOT_TOKEN:'test-bot', DEFAULT_SUPABASE_USER_ID:'00000000-0000-0000-0000-000000000001', ...options.env};
@@ -145,7 +145,7 @@ test('selecting category/account sends exact UUIDs and returns review without co
   const h=load('telegram-webhook',{rpc:(_,args)=>revisionResult(args)});
   await h.handler(request(callback(`${action}:${encoded(stagedId)}:${encoded(choiceId)}`)));
   const rpc=h.calls.find(c=>c.rpc);assert.equal(rpc.rpc,'backend_revise_staged_transaction');assert.equal(rpc.args.p_staging_id,stagedId);assert.equal(rpc.args.p_choice_id,choiceId);assert.equal(rpc.args.p_action,action==='sc'?'category':'account');
-  const edit=h.messages.find(m=>m.message_id);assert.match(edit.text,/Food &amp; drinks/);assert.equal(edit.reply_markup.inline_keyboard.flat().length,4);
+  const edit=h.messages.find(m=>m.message_id);assert.match(edit.text,/Food &amp; drinks/);assert.deepEqual(edit.reply_markup.inline_keyboard.flat().map(b=>b.text),['✅ Confirm','❌ Reject','Edit category','Edit account','🔁 Own account']);
   assert.equal(h.calls.filter(c=>c.rpc).length,1);
  }
 });
@@ -168,4 +168,89 @@ test('email confirmation includes both editors and escapes receipt text',async()
  const h=load('receipt-email-worker',{env:{TELEGRAM_CONFIRM_CHAT_ID:'101'}});await h.handler(request({transaction:{amount:100,categoryName:'Food & drinks',description:'<b>Lunch</b>'}}));
  const sent=h.messages.find(m=>m.reply_markup);assert.ok(sent);assert.match(sent.text,/&lt;b&gt;Lunch&lt;\/b&gt;/);
  assert.deepEqual(sent.reply_markup.inline_keyboard[1].map(b=>b.text),['Edit category','Edit account']);
+});
+
+function transferResult(args, {set = false, type = 'outcome'} = {}) {
+ return {data:{stagingData:{id:stagedId,type,amount:250000,currency:'IDR',occurred_at:'2026-09-17T05:00:00Z',description:'To my <BCA>',transfer_to_account_id:set?choiceId:null},categoryName:'Food',accountName:'Mandiri',transferAccountName:set?'BCA & co':null,page:args.p_page,choices:Array.from({length:9},(_,i)=>({id:`20000000-0000-0000-0000-${String(i+2).padStart(12,'0')}`,name:`Account ${i}`}))},error:null};
+}
+function transferConfirmation(extra = {}) {
+ return {data:{stagingData:{amount:250000,description:'To my <BCA>'},txn:{type:'transfer_out'},transferId:'30000000-0000-0000-0000-0000000000f1',accountName:'Mandiri',transferToAccountName:'BCA',...extra},error:null};
+}
+test('own-account picker paginates, asks for transfer targets and fits the callback byte limit',async()=>{
+ const h=load('telegram-webhook',{rpc:(_,args)=>transferResult(args)});
+ await h.handler(request(callback(`et:${stagedId}:1`)));
+ const rpc=h.calls.find(c=>c.rpc);assert.equal(rpc.rpc,'backend_revise_staged_transaction');assert.equal(rpc.args.p_action,'transfer_targets');assert.equal(rpc.args.p_page,1);assert.equal(rpc.args.p_telegram_user_id,101);
+ const edited=h.messages.find(m=>m.message_id);assert.match(edited.text,/destination account/);
+ const buttons=edited.reply_markup.inline_keyboard.flat();
+ for(const text of ['Previous','Next','Back to review']) assert.ok(buttons.some(b=>b.text===text));
+ assert.ok(buttons.filter(b=>/^Account \d$/.test(b.text)).every(b=>b.callback_data.startsWith('st:')));
+ for(const b of buttons) assert.ok(Buffer.byteLength(b.callback_data)<=64);
+});
+test('choosing a destination sends exact UUIDs and the review shows the route with a way back',async()=>{
+ const h=load('telegram-webhook',{rpc:(_,args)=>transferResult(args,{set:true})});
+ await h.handler(request(callback(`st:${encoded(stagedId)}:${encoded(choiceId)}`)));
+ const rpc=h.calls.find(c=>c.rpc);assert.equal(rpc.args.p_action,'transfer');assert.equal(rpc.args.p_staging_id,stagedId);assert.equal(rpc.args.p_choice_id,choiceId);
+ assert.equal(h.calls.filter(c=>c.rpc).length,1);
+ const edit=h.messages.find(m=>m.message_id);
+ assert.match(edit.text,/transfer \(own account\)/);assert.match(edit.text,/From: Mandiri/);assert.match(edit.text,/To: BCA &amp; co/);assert.doesNotMatch(edit.text,/Category:/);assert.match(edit.text,/To my &lt;BCA&gt;/);
+ const buttons=edit.reply_markup.inline_keyboard.flat();
+ for(const text of ['✅ Confirm','↩ Not a transfer','Change destination']) assert.ok(buttons.some(b=>b.text===text));
+ assert.ok(!buttons.some(b=>b.text==='🔁 Own account'));
+ for(const b of buttons) assert.ok(Buffer.byteLength(b.callback_data)<=64);
+});
+test('Not a transfer clears the destination and restores the category line',async()=>{
+ const h=load('telegram-webhook',{rpc:(_,args)=>transferResult(args)});
+ await h.handler(request(callback(`nt:${stagedId}`)));
+ const rpc=h.calls.find(c=>c.rpc);assert.equal(rpc.args.p_action,'clear_transfer');assert.equal(rpc.args.p_staging_id,stagedId);assert.equal(rpc.args.p_choice_id,null);
+ const edit=h.messages.find(m=>m.message_id);assert.match(edit.text,/Category: Food/);
+ assert.ok(edit.reply_markup.inline_keyboard.flat().some(b=>b.text==='🔁 Own account'));
+});
+test('an incoming receipt is not offered the own-account button',async()=>{
+ const h=load('telegram-webhook',{rpc:(_,args)=>transferResult(args,{type:'income'})});
+ await h.handler(request(callback(`review:${stagedId}`)));
+ const buttons=h.messages.find(m=>m.message_id).reply_markup.inline_keyboard.flat();
+ assert.ok(!buttons.some(b=>/Own account|Not a transfer|Change destination/.test(b.text)));
+});
+test('a failed transfer selection reports a safe error and does not edit the review',async()=>{
+ const h=load('telegram-webhook',{rpc:()=>({data:null,error:{message:'private internal detail'}})});
+ await h.handler(request(callback(`st:${encoded(stagedId)}:${encoded(choiceId)}`)));
+ assert.ok(!h.messages.some(m=>m.message_id));assert.match(h.messages.at(-1).text,/unavailable/);assert.doesNotMatch(h.messages.at(-1).text,/private internal/);
+});
+test('confirming a transfer names both accounts, warns about the credit email and never checks budgets',async()=>{
+ const h=load('telegram-webhook',{rpc:()=>transferConfirmation()});
+ await h.handler(request(callback(`confirm:${stagedId}`)));
+ const edit=h.messages.find(m=>m.message_id);
+ assert.match(edit.text,/Confirmed &amp; Saved as transfer/);assert.match(edit.text,/From: Mandiri/);assert.match(edit.text,/To: BCA/);assert.match(edit.text,/To my &lt;BCA&gt;/);assert.match(edit.text,/reject that receipt/);
+ assert.ok(!h.calls.some(c=>c.table==='budgets'));
+});
+test('a repeated confirm that only returns the transfer id still reports a transfer',async()=>{
+ const h=load('telegram-webhook',{rpc:()=>transferConfirmation({accountName:undefined,transferToAccountName:undefined})});
+ await h.handler(request(callback(`confirm:${stagedId}`)));
+ const edit=h.messages.find(m=>m.message_id);assert.match(edit.text,/Saved as transfer/);assert.doesNotMatch(edit.text,/From:/);assert.match(edit.text,/reject that receipt/);
+});
+test('replying confirm to a transfer receipt reports the transfer',async()=>{
+ const h=load('telegram-webhook',{reply:true,rpc:()=>transferConfirmation()});
+ await h.handler(request(update('confirm',{reply_to_message:{message_id:10,chat:{id:101}}})));
+ const sent=h.messages.at(-1);assert.match(sent.text,/Confirmed and saved as transfer/);assert.match(sent.text,/To: BCA/);assert.match(sent.text,/reject that receipt/);
+ assert.ok(!h.calls.some(c=>c.table==='budgets'));
+});
+test('confirming an ordinary receipt is reported as before',async()=>{
+ const h=load('telegram-webhook',{rpc:()=>({data:{stagingData:{amount:1,description:'safe'},txn:{type:'income'}},error:null})});
+ await h.handler(request(callback(`confirm:${stagedId}`)));
+ const edit=h.messages.find(m=>m.message_id);assert.match(edit.text,/Confirmed &amp; Saved/);assert.doesNotMatch(edit.text,/transfer/);
+});
+test('monthly summaries read only income and outcome rows',async()=>{
+ const h=load('telegram-webhook');await h.handler(request(update('/summary')));
+ const reads=h.calls.filter(c=>c.table==='transactions');assert.ok(reads.length>0);
+ for(const read of reads) assert.ok(read.filters.some(f=>f[0]==='in'&&f[1]==='type'&&f[2].join()==='income,outcome'));
+});
+test('email confirmation offers the own-account button only for outgoing receipts',async()=>{
+ const out=load('receipt-email-worker',{env:{TELEGRAM_CONFIRM_CHAT_ID:'101'}});await out.handler(request({transaction:{amount:100,type:'outcome'}}));
+ assert.deepEqual(out.messages.find(m=>m.reply_markup).reply_markup.inline_keyboard[2].map(b=>[b.text,b.callback_data.split(':')[0]]),[['🔁 Own account','et']]);
+ const income=load('receipt-email-worker',{env:{TELEGRAM_CONFIRM_CHAT_ID:'101'}});await income.handler(request({transaction:{amount:100,type:'income'}}));
+ assert.equal(income.messages.find(m=>m.reply_markup).reply_markup.inline_keyboard.length,2);
+});
+test('PDF importer offers the own-account button for outgoing rows only',()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../../scripts/import-bank-pdf.mjs'),'utf8');
+ assert.match(source,/row\.type === "outcome" \? \[\[\{ text: "Own account", callback_data: `et:\$\{stagingId\}:0` \}\]\] : \[\]/);
 });

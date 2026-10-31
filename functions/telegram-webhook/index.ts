@@ -300,13 +300,16 @@ async function processStagedTransaction(stagingId: string, telegramUserId: numbe
   return data;
 }
 async function confirmStagedTransaction(stagingId: string, telegramUserId?: number) {
-  const { stagingData, txn } = await processStagedTransaction(stagingId, telegramUserId, "confirm");
+  const result = await processStagedTransaction(stagingId, telegramUserId, "confirm");
+  const { stagingData, txn } = result;
+  // A transfer saves its debit leg as txn (type transfer_out), so it never counts toward a budget.
+  const transfer = result.transferId ? { from: result.accountName, to: result.transferToAccountName } : null;
   let budgetStatus = null;
   if (txn?.type === "outcome") {
     budgetStatus = await checkBudgetStatus(txn.user_id, txn.category_id, txn.amount, txn.occurred_at)
       .catch(() => null);
   }
-  return { stagingData, txn, budgetStatus };
+  return { stagingData, txn, budgetStatus, transfer };
 }
 async function rejectStagedTransaction(stagingId: string, telegramUserId?: number) {
   const { stagingData } = await processStagedTransaction(stagingId, telegramUserId, "reject");
@@ -330,43 +333,66 @@ function expandId(value: string) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function reviewKeyboard(stagingId: string) {
-  return { inline_keyboard: [
+function reviewKeyboard(staged: any) {
+  const stagingId = staged.id;
+  const rows: any[] = [
     [{ text: "✅ Confirm", callback_data: `confirm:${stagingId}` }, { text: "❌ Reject", callback_data: `reject:${stagingId}` }],
     [{ text: "Edit category", callback_data: `ec:${stagingId}:0` }, { text: "Edit account", callback_data: `ea:${stagingId}:0` }]
-  ] };
+  ];
+  // Only an outgoing receipt can be a transfer to one of the owner's own accounts.
+  if (staged.type === "outcome") {
+    rows.push(staged.transfer_to_account_id
+      ? [{ text: "↩ Not a transfer", callback_data: `nt:${stagingId}` }, { text: "Change destination", callback_data: `et:${stagingId}:0` }]
+      : [{ text: "🔁 Own account", callback_data: `et:${stagingId}:0` }]);
+  }
+  return { inline_keyboard: rows };
+}
+
+// Reminder shown once a transfer is saved: the receiving bank may email the same movement as a credit.
+const TRANSFER_DUPLICATE_HINT = "If the destination bank also emails you about this credit, reject that receipt.";
+
+function transferSavedLines(stagingData: any, transfer: { from?: string; to?: string }) {
+  const route = transfer.from && transfer.to ? `\nFrom: ${escapeHtml(transfer.from)}\nTo: ${escapeHtml(transfer.to)}` : "";
+  return `Amount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR${route}\nDesc: ${escapeHtml(stagingData.description)}\n\n${TRANSFER_DUPLICATE_HINT}`;
 }
 
 function revisionMessage(result: any, action: string) {
   const p = result.stagingData;
   const when = new Date(p.occurred_at).toLocaleString("en-GB", { timeZone: "Asia/Jakarta", hour12: false });
-  let text = `<b>Review transaction</b>\n\nType: ${escapeHtml(p.type)}\nAmount: ${Number(p.amount).toLocaleString("id-ID")} ${escapeHtml(p.currency || "IDR")}\nCategory: ${escapeHtml(result.categoryName || "Uncategorized")}\nAccount: ${escapeHtml(result.accountName || "Bank")}\nWhen: ${when}\nDescription: ${escapeHtml(p.description)}`;
+  // A receipt marked as a transfer has no category; it moves money between two of the owner's accounts.
+  const isTransfer = Boolean(p.transfer_to_account_id);
+  const route = isTransfer
+    ? `From: ${escapeHtml(result.accountName || "Bank")}\nTo: ${escapeHtml(result.transferAccountName || "Unknown")}`
+    : `Category: ${escapeHtml(result.categoryName || "Uncategorized")}\nAccount: ${escapeHtml(result.accountName || "Bank")}`;
+  let text = `<b>Review transaction</b>\n\nType: ${isTransfer ? "transfer (own account)" : escapeHtml(p.type)}\nAmount: ${Number(p.amount).toLocaleString("id-ID")} ${escapeHtml(p.currency || "IDR")}\n${route}\nWhen: ${when}\nDescription: ${escapeHtml(p.description)}`;
   if (p.metadata?.email_subject) text += `\nEmail: ${escapeHtml(String(p.metadata.email_subject).slice(0, 120))}`;
-  if (action !== "ec" && action !== "ea") {
-    return { text: text + "\n\nReview the category and account, then confirm to save.", reply_markup: reviewKeyboard(p.id) };
+  if (!["ec", "ea", "et"].includes(action)) {
+    const hint = isTransfer ? "Confirm to save it as a transfer between your accounts." : "Review the category and account, then confirm to save.";
+    return { text: text + `\n\n${hint}`, reply_markup: reviewKeyboard(p) };
   }
-  const isCategory = action === "ec";
-  const currentId = isCategory ? p.category_id : p.account_id;
+  const picker = { ec: { select: "sc", noun: "a category", currentId: p.category_id },
+    ea: { select: "sa", noun: "an account", currentId: p.account_id },
+    et: { select: "st", noun: "the destination account", currentId: p.transfer_to_account_id } }[action];
   const choices = result.choices || [];
   const keyboard = choices.slice(0, 8).map((choice: any) => [{
-    text: `${choice.id === currentId ? "✓ " : ""}${choice.name}`,
-    callback_data: `${isCategory ? "sc" : "sa"}:${compactId(p.id)}:${compactId(choice.id)}`
+    text: `${choice.id === picker.currentId ? "✓ " : ""}${choice.name}`,
+    callback_data: `${picker.select}:${compactId(p.id)}:${compactId(choice.id)}`
   }]);
   const navigation = [];
   if (result.page > 0) navigation.push({ text: "Previous", callback_data: `${action}:${p.id}:${result.page - 1}` });
   if (choices.length > 8) navigation.push({ text: "Next", callback_data: `${action}:${p.id}:${result.page + 1}` });
   if (navigation.length) keyboard.push(navigation);
   keyboard.push([{ text: "Back to review", callback_data: `review:${p.id}` }]);
-  text += choices.length ? `\n\nChoose ${isCategory ? "a category" : "an account"} (page ${result.page + 1}).` : "\n\nNo available choices on this page.";
+  text += choices.length ? `\n\nChoose ${picker.noun} (page ${result.page + 1}).` : "\n\nNo available choices on this page.";
   return { text, reply_markup: { inline_keyboard: keyboard } };
 }
 
 async function reviseStagedTransaction(action: string, id: string, selection: string | undefined, telegramUserId: number) {
-  const selecting = action === "sc" || action === "sa";
+  const selecting = action === "sc" || action === "sa" || action === "st";
   const stagingId = selecting ? expandId(id) : id;
-  const page = action === "ec" || action === "ea" ? Number(selection || 0) : 0;
+  const page = action === "ec" || action === "ea" || action === "et" ? Number(selection || 0) : 0;
   if (!Number.isSafeInteger(page) || page < 0 || page > 10000) throw new Error("Invalid page.");
-  const actions = { ec: "categories", ea: "accounts", sc: "category", sa: "account", review: "view" };
+  const actions = { ec: "categories", ea: "accounts", et: "transfer_targets", sc: "category", sa: "account", st: "transfer", nt: "clear_transfer", review: "view" };
   const { data, error } = await supabase.rpc("backend_revise_staged_transaction", {
     p_staging_id: stagingId, p_telegram_user_id: telegramUserId, p_action: actions[action],
     p_choice_id: selecting ? expandId(selection || "") : null, p_page: page
@@ -670,6 +696,8 @@ async function querySummaryData(months, userId?: string) {
     let query = supabase
       .from("transactions")
       .select("type, amount")
+      // Transfer legs are not income or outcome, so they stay out of the totals and the count.
+      .in("type", ["income", "outcome"])
       .gte("occurred_at", startOfMonth.toISOString())
       .lt("occurred_at", endOfMonth.toISOString())
       .is("deleted_at", null);
@@ -860,7 +888,7 @@ serve(async (req)=>{
           return new Response("ok");
         }
 
-        if (["ec", "ea", "sc", "sa", "review"].includes(action)) {
+        if (["ec", "ea", "et", "sc", "sa", "st", "nt", "review"].includes(action)) {
           await answerCallback("Loading receipt...");
           const revised = await reviseStagedTransaction(action, stagingId, selection, from.id);
           await editMessageText(revised.text, revised.reply_markup);
@@ -872,8 +900,10 @@ serve(async (req)=>{
         }
 
         if (action === "confirm") {
-          const { stagingData, budgetStatus } = await confirmStagedTransaction(stagingId, from?.id);
-          await editMessageText(`✅ <b>Confirmed &amp; Saved</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${escapeHtml(stagingData.description)}`);
+          const { stagingData, budgetStatus, transfer } = await confirmStagedTransaction(stagingId, from?.id);
+          await editMessageText(transfer
+            ? `✅ <b>Confirmed &amp; Saved as transfer</b>\n${transferSavedLines(stagingData, transfer)}`
+            : `✅ <b>Confirmed &amp; Saved</b>\nAmount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR\nDesc: ${escapeHtml(stagingData.description)}`);
 
           console.log("Telegram callback completed", {
             action,
@@ -1090,8 +1120,10 @@ Desc: ${stagingData.description}`);
           return new Response("ok");
         }
 
-        const { stagingData, budgetStatus } = await confirmStagedTransaction(stagingId, telegramUserId);
-        let replyText = `✅ Confirmed and saved
+        const { stagingData, budgetStatus, transfer } = await confirmStagedTransaction(stagingId, telegramUserId);
+        let replyText = transfer
+          ? `✅ Confirmed and saved as transfer\n${transferSavedLines(stagingData, transfer)}`
+          : `✅ Confirmed and saved
 Amount: ${Number(stagingData.amount).toLocaleString("id-ID")} IDR
 Desc: ${stagingData.description}`;
         if (budgetStatus?.progress) {

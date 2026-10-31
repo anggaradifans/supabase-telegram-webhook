@@ -4,6 +4,8 @@ New email receipt confirmations have **Edit category** and **Edit account** butt
 
 Categories are limited to the owner's private categories and shared defaults compatible with the receipt's income/outcome type. Accounts use the existing shared account catalog. The database verifies the active Telegram sender and receipt owner on every menu request and selection. Edits and confirmations lock the same staging row; confirmed or rejected receipts cannot be revised.
 
+Outgoing receipts also have an **🔁 Own account** button; see `STAGED_TRANSFERS.md`.
+
 Edits apply only to that receipt. There is no merchant learning, category creation from the menu, or automatic repair of historical transactions. Older Telegram messages retain their original buttons.
 
 ## Rollout

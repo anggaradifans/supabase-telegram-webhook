@@ -157,7 +157,9 @@ async function sendTransactionConfirmation(stagingId: string, p: ParsedTransacti
           [
             { text: "Edit category", callback_data: `ec:${stagingId}:0` },
             { text: "Edit account", callback_data: `ea:${stagingId}:0` }
-          ]
+          ],
+          // Only an outgoing receipt can be marked as a transfer to one of the owner's accounts.
+          ...(p.type === "outcome" ? [[{ text: "🔁 Own account", callback_data: `et:${stagingId}:0` }]] : [])
         ]
       }
     })
