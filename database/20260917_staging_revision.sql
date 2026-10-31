@@ -1,4 +1,7 @@
 -- Apply after 20260915_backend_compatibility.sql, before deploying the revised handlers.
+-- SUPERSEDED: backend_revise_staged_transaction is now defined by financial-tracker-dashboard
+-- supabase/migrations/20261031120000_staged_transfers.sql (adds the own-account transfer actions).
+-- Do not re-run this file after that migration: it would restore the old function. See STAGED_TRANSFERS.md.
 BEGIN;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '60s';
