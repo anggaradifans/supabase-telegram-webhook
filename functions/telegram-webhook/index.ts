@@ -583,7 +583,7 @@ async function queryOutcomes(dateParams, userId?: string) {
     .select(`
       id, type, amount, occurred_at, description,
       categories(name),
-      accounts(name)
+      accounts:accounts!transactions_account_owner_fkey(name)
     `)
     .eq("type", "outcome")
     .is("deleted_at", null)

@@ -46,7 +46,18 @@ test('financial messages in a group are rejected',async()=>{
 test('summary reads only the mapped user transactions',async()=>{
  const h=load('telegram-webhook');await h.handler(request(update('/summary')));
  const reads=h.calls.filter(c=>c.table==='transactions');assert.ok(reads.length>0);
- for(const read of reads) assert.ok(read.filters.some(f=>f[0]==='eq' && f[1]==='user_id' && f[2]==='00000000-0000-0000-0000-000000000001'));
+ for(const read of reads) {
+  assert.ok(read.filters.some(f=>f[0]==='eq' && f[1]==='user_id' && f[2]==='00000000-0000-0000-0000-000000000001'));
+ }
+});
+test('outcome reports disambiguate owner-scoped accounts and keep mapped ownership',async()=>{
+ const h=load('telegram-webhook');await h.handler(request(update('/outcome')));
+ const reads=h.calls.filter(c=>c.table==='transactions');assert.ok(reads.length>0);
+ for(const read of reads) {
+  const select=read.filters.find(f=>f[0]==='select');
+  assert.match(select[1],/accounts:accounts!transactions_account_owner_fkey\(name\)/);
+  assert.ok(read.filters.some(f=>f[0]==='eq'&&f[1]==='user_id'&&f[2]==='00000000-0000-0000-0000-000000000001'));
+ }
 });
 test('bulk confirmation and rejection never fall back to all users',async()=>{
  for(const text of ['/confirm_all','/reject_all']) {
