@@ -629,11 +629,11 @@ async function fetchWithRetry(url, options, label) {
   }
 }
 
-async function getOrCreateAccount(name) {
-  const inserted = await supabaseRequest("accounts?select=id&on_conflict=name", {
+async function getOrCreateAccount(name, userId) {
+  const inserted = await supabaseRequest("accounts?select=id&on_conflict=user_id,name", {
     method: "POST",
     headers: { prefer: "return=representation,resolution=merge-duplicates" },
-    body: JSON.stringify({ name })
+    body: JSON.stringify({ name, user_id: userId })
   });
   return inserted[0].id;
 }
@@ -654,7 +654,7 @@ async function insertStaging(row) {
     method: "POST",
     body: JSON.stringify({ p_user_id: userId, p_name: row.categoryName })
   });
-  const account_id = await getOrCreateAccount(row.accountName);
+  const account_id = await getOrCreateAccount(row.accountName, userId);
   const duplicate = await findDuplicate(row);
   if (duplicate) return { id: duplicate.id, duplicate: true };
 

@@ -70,6 +70,8 @@ test('email requires configured owner before category or staging writes',async()
 });
 test('email category resolution and staging use same explicit owner',async()=>{
  const h=load('receipt-email-worker');await h.handler(request({transaction:{amount:100,categoryName:'Food'}}));
+ const account=h.calls.find(c=>c.table==='accounts'&&c.op==='upsert');assert.ok(account);
+ const upsert=account.filters.find(f=>f[0]==='upsert');assert.equal(upsert[1].user_id,'00000000-0000-0000-0000-000000000001');assert.equal(upsert[2].onConflict,'user_id,name');
  const category=h.calls.find(c=>c.rpc==='backend_resolve_category');const staging=h.calls.find(c=>c.table==='transaction_staging'&&c.op==='insert');assert.ok(category && staging);assert.equal(staging.filters.find(f=>f[0]==='insert')[1].user_id,category.args.p_user_id);
 });
 
@@ -88,6 +90,7 @@ test('PDF importer scopes duplicate search and category creation to configured o
  vm.createContext(context);vm.runInContext(section,context);
  await context.insertStaging({categoryName:'Private',accountName:'Jenius',type:'outcome',amount:1,occurred_at:'2026-09-15T00:00:00Z',description:'test'});
  assert.equal(JSON.parse(calls[0][1].body).p_user_id,owner);
+ const account=calls.find(([p])=>p==='accounts?select=id&on_conflict=user_id,name');assert.ok(account);assert.equal(JSON.parse(account[1].body).user_id,owner);
  assert.ok(calls.some(([p])=>p.includes('user_id=eq.'+owner)));
  const write=calls.find(([p])=>p==='transaction_staging?select=id');assert.equal(JSON.parse(write[1].body).user_id,owner);
  assert.match(source,/callback_data: `ec:\$\{stagingId\}:0`/);

@@ -96,9 +96,9 @@ async function getOrCreateCategory(name: string, userId: string) {
   return data;
 }
 
-async function getOrCreateAccount(name: string) {
+async function getOrCreateAccount(name: string, userId: string) {
   const { data, error } = await supabase.from("accounts")
-    .upsert({ name }, { onConflict: "name" }).select("id").single();
+    .upsert({ name, user_id: userId }, { onConflict: "user_id,name" }).select("id").single();
   if (error) throw new Error("Account resolution failed.");
   return data.id;
 }
@@ -106,7 +106,7 @@ async function getOrCreateAccount(name: string) {
 async function createStagingTransaction(p: ParsedTransaction) {
   const userId = requireEnv("DEFAULT_SUPABASE_USER_ID", DEFAULT_SUPABASE_USER_ID);
   const categoryId = await getOrCreateCategory(p.categoryName, userId);
-  const accountId = await getOrCreateAccount(p.accountName);
+  const accountId = await getOrCreateAccount(p.accountName, userId);
 
   const { data, error } = await supabase
     .from("transaction_staging")
